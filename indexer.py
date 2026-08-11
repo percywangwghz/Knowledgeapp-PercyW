@@ -183,10 +183,13 @@ def scan_knowledge_base():
 
 
 def build_index(force=False):
-    """构建或更新索引"""
+    """构建或更新索引（索引文件损坏时自动重建）"""
     if not force and os.path.exists(INDEX_FILE):
-        with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            print(f"[WARN] 索引文件损坏，重建：{INDEX_FILE}")
     
     print(f"[SCAN] Scanning knowledge base: {KNOWLEDGE_DIR}")
     documents, categories = scan_knowledge_base()
@@ -207,11 +210,14 @@ def build_index(force=False):
 
 
 def load_index():
-    """加载索引"""
+    """加载索引（文件损坏时自动重建）"""
     if os.path.exists(INDEX_FILE):
-        with open(INDEX_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return build_index()
+        try:
+            with open(INDEX_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            print(f"[WARN] 索引文件损坏，重建：{INDEX_FILE}")
+    return build_index(force=True)
 
 
 def search_documents(index, query):

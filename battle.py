@@ -406,6 +406,9 @@ def render_battle(index, on_saved):
     options = {f"{d.get('category_icon', '📁')} [{d.get('category', '其他')}] "
                f"{d.get('title') or d['name'].replace('.md', '')}": d for d in docs}
     labels = list(options.keys())
+    if not labels:
+        st.info("知识库还没有可 Battle 的文档：先到「📥 文件归档」归档一篇项目/行业文档，再回来。")
+        return
     default_idx = 0
     for i, label in enumerate(labels):
         if options[label]["path"] == st.session_state.get("battle_doc_path"):

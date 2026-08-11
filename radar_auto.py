@@ -158,8 +158,11 @@ def _path(name):
 
 def _load(name, default):
     if os.path.exists(_path(name)):
-        with open(_path(name), "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(_path(name), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return default  # 文件损坏/被改坏时按空处理，不崩页面
     return default
 
 

@@ -245,8 +245,11 @@ def _job_running():
 
 def _read_job():
     if os.path.exists(_path(JOB_FILE)):
-        with open(_path(JOB_FILE), "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(_path(JOB_FILE), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None  # 任务文件损坏时按无任务处理，不崩页面
     return None
 
 

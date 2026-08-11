@@ -299,8 +299,11 @@ def _path(name):
 
 def _load(name, default):
     if os.path.exists(_path(name)):
-        with open(_path(name), "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(_path(name), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return default  # 文件损坏/被改坏时按空处理，不崩页面
     return default
 
 
@@ -413,6 +416,7 @@ def build_weekly_report(start, end, key_questions):
 def _write_report(report_md, end):
     filename = f"市场认知周报_{end.strftime('%Y%m%d')}.md"
     abs_path = os.path.join(KNOWLEDGE_DIR, REPORT_CATEGORY, filename)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)  # 知识库没有 05_tracking/ 时自动建
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(report_md)
     return abs_path
@@ -523,14 +527,18 @@ def render_radar(index, on_saved):
             st.markdown("<div style='margin-top:1.6rem'></div>", unsafe_allow_html=True)
             refresh = st.button("🔄 更新认知", help="基于该主题近 7 天信号重新生成叙事与边际变量")
         if refresh:
-            with st.spinner(f"正在更新「{theme}」认知…"):
-                res = radar_auto.update_cognition(theme)
-            if res.get("updated") or res.get("variables"):
-                st.toast(f"已更新：叙事 {'✓' if res.get('updated') else '不变'}，"
-                         f"新增边际变量 {res.get('variables', 0)} 个")
-                st.rerun()
+            if not llm.get_api_key():
+                st.warning("未填入 Moonshot API Key，无法更新认知："
+                           "请先在左侧边栏「API Key」处填入你自己的 key（sk-...）。")
             else:
-                st.info(f"「{theme}」近 7 天信号不足，暂无更新（先跑一次自动抓取）。")
+                with st.spinner(f"正在更新「{theme}」认知…"):
+                    res = radar_auto.update_cognition(theme)
+                if res.get("updated") or res.get("variables"):
+                    st.toast(f"已更新：叙事 {'✓' if res.get('updated') else '不变'}，"
+                             f"新增边际变量 {res.get('variables', 0)} 个")
+                    st.rerun()
+                else:
+                    st.info(f"「{theme}」近 7 天信号不足，暂无更新（先跑一次自动抓取）。")
 
         entry = themes.get(theme, {"current": {}, "history": []})
         cur = entry.get("current", {})
@@ -604,10 +612,14 @@ def render_radar(index, on_saved):
             with st.expander("📋 预览周报", expanded=True):
                 st.markdown(report)
             if st.button("💾 写入知识库（05_tracking）"):
-                path = _write_report(report, end)
-                on_saved()
-                st.success(f"已写入：{os.path.basename(path)}")
-                st.rerun()
+                try:
+                    path = _write_report(report, end)
+                except OSError as e:
+                    st.error(f"写入失败：{e}。请检查知识库目录存在且可写。")
+                else:
+                    on_saved()
+                    st.success(f"已写入：{os.path.basename(path)}")
+                    st.rerun()
 
     # ---------- Tab 5: 公众号文章 → 技术提取 ----------
     with tab5:
