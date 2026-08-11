@@ -224,11 +224,20 @@ def resolve_target_name(extraction):
     return _sanitize_filename(extraction.get("new_title") or extraction.get("one_liner")) + ".md"
 
 
+def resolve_target_path(filename):
+    """目标文档的绝对路径，清洗规则与 save_tech_doc 完全一致。
+    LLM 路由返回的文件名是未清洗的原始值（可能含 ../ 等），读取既有文档必须
+    走同一清洗：否则名字对不上会重复建文档，极端情况还会逃出 09_tech 读到外部文件。"""
+    name = _sanitize_filename(os.path.splitext(filename)[0])
+    # _sanitize_filename 已把路径分隔符替换为 _，basename 再兜一层防逃逸
+    return os.path.join(tech_dir(), os.path.basename(name) + ".md")
+
+
 def save_tech_doc(filename, content):
     """写入 09_tech（已存在则覆盖——合并模式）。返回绝对路径。"""
     d = tech_dir()
     os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, _sanitize_filename(os.path.splitext(filename)[0]) + ".md")
+    path = resolve_target_path(filename)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content.rstrip() + "\n")
     return path
@@ -238,7 +247,7 @@ def process_article(article, docs=None):
     """单篇全流程（CLI 用）：提取路由 → 读既有文档 → 合并 → 写盘。返回 {"path","is_new","ext"}。"""
     ext = extract_and_route(article, docs)
     name = resolve_target_name(ext)
-    path = os.path.join(tech_dir(), name)
+    path = resolve_target_path(name)
     existing = ""
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -267,7 +276,7 @@ def main():
             print(json.dumps(ext, ensure_ascii=False, indent=2))
             continue
         name = resolve_target_name(ext)
-        path = os.path.join(tech_dir(), name)
+        path = resolve_target_path(name)
         existing = ""
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:

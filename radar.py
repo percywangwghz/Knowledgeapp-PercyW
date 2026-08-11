@@ -233,7 +233,7 @@ def _run_tech_merge(good):
             name = tech.resolve_target_name(ext)
             state["steps"].append({"title": name[:-3], "status": "running", "detail": ""})
             _write_tech_job(state)
-            path = os.path.join(tech.tech_dir(), name)
+            path = tech.resolve_target_path(name)
             existing = ""
             if os.path.exists(path):
                 with open(path, encoding="utf-8") as f:
@@ -342,13 +342,14 @@ def build_weekly_report(start, end, key_questions):
     ]
     hot = {}
     for s in signals:
-        hot[s["theme"]] = hot.get(s["theme"], 0) + 1
+        theme = s.get("theme", "其他")  # pool JSON 可手改，缺键条目归入“其他”而不是崩掉
+        hot[theme] = hot.get(theme, 0) + 1
     if hot:
         lines.append("本周信号分布：" + "；".join(f"**{t}** {n} 条" for t, n in sorted(hot.items(), key=lambda x: -x[1])) + "。")
     if theme_updates:
         lines.append(f"叙事有更新的主题：{'、'.join(theme_updates)}。")
     if variables:
-        lines.append(f"新增边际变量 {len(variables)} 个：{'、'.join(v['title'] for v in variables[:5])}。")
+        lines.append(f"新增边际变量 {len(variables)} 个：{'、'.join(v.get('title', '—') for v in variables[:5])}。")
     if not (signals or variables or theme_updates):
         lines.append("本周无新录入信息。")
 
@@ -394,7 +395,7 @@ def build_weekly_report(start, end, key_questions):
     if variables:
         for v in variables:
             lines += [
-                f"### {v['title']}（{v.get('var_type', '—')} / {v.get('theme', '—')}）",
+                f"### {v.get('title', '—')}（{v.get('var_type', '—')} / {v.get('theme', '—')}）",
                 "",
                 f"- **新增信息**：{v.get('new_info', '—')}",
                 f"- **原有预期**：{v.get('prev_expect', '—')}",
@@ -498,8 +499,9 @@ def render_radar(index, on_saved):
                     track = f" · {s['sub_track']}" if s.get("sub_track") else ""
                     imp = f" · ⚑{s['importance']}" if s.get("importance") else ""
                     html = (
-                        f"<div class='meta-line'>[{s['date']}] {s['source_type']} · {s['theme']} · {s['event_type']}{track}{imp}</div>"
-                        f"<div style='font-weight:600'>{auto_mark}{s['title']}</div>")
+                        f"<div class='meta-line'>[{s.get('date', '—')}] {s.get('source_type', '—')} · "
+                        f"{s.get('theme', '—')} · {s.get('event_type', '—')}{track}{imp}</div>"
+                        f"<div style='font-weight:600'>{auto_mark}{s.get('title', '（无标题）')}</div>")
                     if s.get("summary"):
                         html += f"<div class='caption'>{s['summary'][:150]}</div>"
                     if s.get("why"):
@@ -584,7 +586,8 @@ def render_radar(index, on_saved):
             st.info("尚无边际变量——自动抓取后由 AI 从信号中提炼，或到「主题叙事」手动触发更新。")
         for v in variables[-15:][::-1]:
             auto_mark = "🤖 " if v.get("auto") else ""
-            with st.expander(f"[{v['date']}] {auto_mark}{v['title']}（{v.get('var_type', '—')} / {v.get('theme', '—')}）"):
+            with st.expander(f"[{v.get('date', '—')}] {auto_mark}{v.get('title', '（无标题）')}"
+                             f"（{v.get('var_type', '—')} / {v.get('theme', '—')}）"):
                 st.markdown(f"**边际变量**：{v.get('marginal_var', '—')}")
                 st.markdown(f"**新增信息**：{v.get('new_info', '—')}")
                 st.markdown(f"**预期变化**：{v.get('prev_expect', '—')} → {v.get('expect_change', '—')}")
@@ -692,7 +695,7 @@ def render_radar(index, on_saved):
                 for r in good:
                     a, ext = r["article"], r["ext"]
                     name = tech.resolve_target_name(ext)
-                    is_new = not os.path.exists(os.path.join(tech.tech_dir(), name))
+                    is_new = not os.path.exists(tech.resolve_target_path(name))
                     tag = "🆕 新建" if is_new else "🔀 合并"
                     with st.expander(f"{tag}《{a.get('title') or '粘贴正文'}》→ {name[:-3]}"):
                         if ext.get("one_liner"):

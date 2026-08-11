@@ -493,6 +493,10 @@ def render_review(index, on_saved):
     if next_battle and st.button("⚔️ 下一步：对该文档发起 Battle", type="primary"):
         st.session_state.pop("review_next_battle_path", None)
         st.session_state.battle_doc_path = next_battle
+        # battle 页 selectbox 一旦实例化过，widget 状态粘性会让 index 预选失效，
+        # 跳转前清掉旧 widget 值（连同旧文档的对话缓存），预选才能对新文档生效
+        st.session_state.pop("battle_doc", None)
+        st.session_state.pop("battle_msgs", None)
         st.session_state.view_mode = "battle"
         st.session_state.selected_doc = None
         st.rerun()
