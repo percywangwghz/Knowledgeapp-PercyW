@@ -20,7 +20,8 @@ from datetime import datetime
 import streamlit as st
 
 from config import KNOWLEDGE_DIR
-from llm import chat, get_api_key, set_thread_api_key
+from llm import (chat, get_api_key, get_base_url, get_model,
+                 set_thread_api_key, set_thread_base_url, set_thread_model)
 
 SESSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "battle_sessions")
 
@@ -108,6 +109,8 @@ _reply_cancel = None    # 当前线程的取消标记（threading.Event，每轮
 _state_lock = threading.Lock()  # 保护 session_state/messages 关键段
 
 PENDING_STALE_SECS = 120  # pending 文件超过该时长未更新且线程已死 → 判定中断
+PARTIAL_THROTTLE = 0.8  # 打字机 partial 落盘节流（秒）：距上次落盘不足此间隔只更新内存
+                        # （SSE chunk 太密，每片都写盘会抖，Windows 上还会撞句柄重试——对齐 ingest）
 
 
 def _pending_file(doc_path):
@@ -163,20 +166,28 @@ def _pending_stale(doc_path, pend):
     return age > PENDING_STALE_SECS
 
 
-def _reply_worker(doc, msgs_snapshot, doc_path, cancel, api_key):
+def _reply_worker(doc, msgs_snapshot, doc_path, cancel, api_key, model=None, base_url=None):
     """后台线程体：调 _ai_reply，部分回复经 on_chunk 实时写 pending 文件。
     cancel 为本轮专属的取消标记：被「中断」置位后，线程不再写任何结果。
     注意：线程内没有 ScriptRunContext，禁止调用任何 st.*；
-    前端注入的 API Key 同样取不到，由 api_key 参数显式带入。"""
+    前端注入的 API Key、模型与端点同样取不到，由 api_key/model/base_url 参数显式带入。"""
     set_thread_api_key(api_key)
+    set_thread_model(model)
+    set_thread_base_url(base_url)
     state = {"status": "running", "partial": "", "error": "",
              "started": datetime.now().isoformat(timespec="seconds")}
+    last_flush = [0.0]  # 上次 partial 落盘时刻（monotonic）
 
     def on_chunk(accumulated):
         if cancel.is_set():
             return
         state["partial"] = accumulated
-        _write_pending(doc_path, state)
+        # 每个 chunk 只更新内存，距上次落盘超过节流间隔才写盘；
+        # 最终 done/error 状态在下面无条件落盘，不会丢末尾
+        now = time.monotonic()
+        if now - last_flush[0] >= PARTIAL_THROTTLE:
+            last_flush[0] = now
+            _write_pending(doc_path, state)
 
     _write_pending(doc_path, state)
     try:
@@ -202,10 +213,12 @@ def _start_reply(doc, doc_path):
     snapshot = list(st.session_state.get("battle_msgs", []))
     _reply_doc_path = doc_path
     _reply_cancel = threading.Event()
-    # 主线程取好当前会话的 API Key 传给工作线程（线程内访问不了 session_state）
+    # 主线程取好当前会话的 API Key、模型与端点传给工作线程（线程内访问不了 session_state）
     _reply_thread = threading.Thread(
         target=_reply_worker,
-        args=(doc, snapshot, doc_path, _reply_cancel, get_api_key()), daemon=True)
+        args=(doc, snapshot, doc_path, _reply_cancel, get_api_key(), get_model(),
+              get_base_url()),
+        daemon=True)
     _reply_thread.start()
     return True
 
@@ -230,13 +243,25 @@ def _break_reply(doc_path):
 
 @st.fragment(run_every=2)
 def _render_reply_live(doc_path):
-    """轮询 pending 文件，打字机式显示进行中的 AI 回复；结束/失败后整页 rerun。"""
-    pend = _read_pending(doc_path) or {}
-    partial = pend.get("partial", "")
-    with st.chat_message("assistant"):
-        st.markdown(partial + " ▌" if partial else "🔴 红队思考中……")
+    """轮询 pending 文件，打字机式显示进行中的 AI 回复。
+    固定挂载（内部按状态决定是否渲染），结束/失败边沿按 started 时间戳去重、
+    只触发一次整页 rerun——避免条件挂载的卸载与整页 rerun 撞车导致前端 DOM 错位。"""
+    pend = _read_pending(doc_path)
+    if not pend:
+        return
+    if pend.get("status") == "running" and not _reply_running_for(doc_path):
+        return  # 线程不在（中断/重启）：交给主流程的中断提示分支
     if pend.get("status") != "running":
-        st.rerun()  # 整页 rerun，由主流程落盘/报错
+        token = pend.get("started", "")
+        if st.session_state.get("_live_fired_battle") != token:
+            st.session_state["_live_fired_battle"] = token
+            st.rerun()  # 整页 rerun，由主流程落盘/报错
+        return
+    partial = pend.get("partial", "")
+    # 纯文本渲染：st.text 原地更新单个文本节点，无 markdown/HTML 重解析、
+    # 无子节点增删——动态 HTML 重解析导致 React 虚拟 DOM 与真实 DOM 脱节，
+    # 是 removeChild 崩溃的根源；完成后的正式排版由主流程一次性渲染
+    st.text(partial + " ▌" if partial else "🔴 红队思考中……")
 
 
 # ==================== AI 调用 ====================
@@ -396,8 +421,8 @@ def render_battle(index, on_saved):
     st.markdown("<div style='margin-bottom:1rem'></div>", unsafe_allow_html=True)
 
     if not get_api_key():
-        st.warning("未填入 Moonshot API Key，AI 功能不可用："
-                   "请先在左侧边栏「API Key」处填入你自己的 key（sk-...）。")
+        st.warning("未填入 API Key，AI 功能不可用："
+                   "请先在左侧边栏「API 设置」处填入你自己的 key（sk-...）。")
         return
 
     # ---- 选择观点来源文档 ----
@@ -525,14 +550,13 @@ def render_battle(index, on_saved):
             st.markdown(m["content"])
 
     # ---- 后台回复状态：进行中打字机显示 / 中断 / 失败 ----
+    _render_reply_live(doc["path"])  # 固定挂载，内部按状态决定是否渲染
     if pend and pend.get("status") == "running":
         if _pending_stale(doc["path"], pend):
             st.warning("AI 回复被中断（应用重启或进程退出）。你的发言已保留，可重新发送。")
             _remove_pending(doc["path"])
             pend = None
             busy = False
-        else:
-            _render_reply_live(doc["path"])
     elif pend and pend.get("status") == "error":
         # 不丢弃用户已发消息（已落盘），只报错，可重试
         st.error(f"调用 AI 失败：{pend.get('error', '未知错误')}。你的发言已保留，可重新发送或稍后再试。")

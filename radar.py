@@ -67,11 +67,13 @@ def _write_job(state):
     os.replace(tmp, _path(JOB_FILE))
 
 
-def _run_job(primary_only, api_key):
+def _run_job(primary_only, api_key, model=None, base_url=None):
     """后台线程体：执行 radar_auto.run，进度实时落盘 radar_job.json。
     注意：线程内没有 ScriptRunContext，禁止调用任何 st.*；
-    前端注入的 API Key 同样取不到，由 api_key 参数显式带入。"""
+    前端注入的 API Key、模型与端点同样取不到，由 api_key/model/base_url 参数显式带入。"""
     llm.set_thread_api_key(api_key)
+    llm.set_thread_model(model)
+    llm.set_thread_base_url(base_url)
     state = {"status": "running", "mode": "primary" if primary_only else "full",
              "started": datetime.now().isoformat(timespec="seconds"),
              "finished": "", "steps": [], "summary": None}
@@ -89,6 +91,11 @@ def _run_job(primary_only, api_key):
     try:
         state["summary"] = radar_auto.run(primary_only=primary_only, progress=progress)
         state["status"] = "done"
+    except llm.SearchNotSupportedError as e:
+        # 厂家无联网搜索能力：全局性配置失败，打标记由 UI 显著提示（不显示堆栈）
+        state["status"] = "error"
+        state["no_search"] = True
+        state["summary"] = {"results": {}, "cognition": {}, "errors": [str(e)]}
     except Exception as e:
         state["status"] = "error"
         state["summary"] = {"results": {}, "cognition": {}, "errors": [str(e)]}
@@ -100,9 +107,10 @@ def _start_job(primary_only):
     global _job_thread
     if _job_running():
         return
-    # 主线程取好当前会话的 API Key 传给工作线程（线程内访问不了 session_state）
+    # 主线程取好当前会话的 API Key、模型与端点传给工作线程（线程内访问不了 session_state）
     _job_thread = threading.Thread(target=_run_job,
-                                   args=(primary_only, llm.get_api_key()), daemon=True)
+                                   args=(primary_only, llm.get_api_key(),
+                                         llm.get_model(), llm.get_base_url()), daemon=True)
     _job_thread.start()
 
 
@@ -110,10 +118,10 @@ _STAGE_LABEL = {"fetch": "抓取", "cognition": "认知"}
 _STATUS_ICON = {"running": "⏳", "done": "✅", "error": "❌"}
 
 
-def _render_job_steps(steps):
+def _steps_html(steps):
+    """任务步骤列表 → 一段 HTML 字符串（供单元素渲染与中断提示复用）。"""
     if not steps:
-        st.markdown("<div class='caption'>正在启动任务…</div>", unsafe_allow_html=True)
-        return
+        return "<div class='caption'>正在启动任务…</div>"
     lines = []
     for s in steps:
         icon = _STATUS_ICON.get(s.get("status"), "")
@@ -123,23 +131,59 @@ def _render_job_steps(steps):
         if s.get("detail") and s.get("status") != "running":
             detail = f"（{html.escape(str(s['detail'])[:200])}）"
         lines.append(f"{icon} {stage} · {theme} {detail}")
-    st.markdown("<div class='caption'>" + "<br>".join(lines) + "</div>",
-                unsafe_allow_html=True)
+    return "<div class='caption'>" + "<br>".join(lines) + "</div>"
+
+
+def _render_job_steps(steps):
+    st.markdown(_steps_html(steps), unsafe_allow_html=True)
+
+
+def _steps_text(steps):
+    """任务步骤列表 → 纯文本（fragment 轮询用：st.text 单文本节点原地更新，
+    无 HTML 解析、无子节点增删，规避 React removeChild 崩溃）。"""
+    if not steps:
+        return "正在启动任务…"
+    lines = []
+    for s in steps:
+        icon = _STATUS_ICON.get(s.get("status"), "")
+        stage = _STAGE_LABEL.get(s.get("stage"), s.get("stage", ""))
+        detail = ""
+        if s.get("detail") and s.get("status") != "running":
+            detail = f"（{str(s['detail'])[:200]}）"
+        lines.append(f"{icon} {stage} · {s.get('theme', '')} {detail}")
+    return "\n".join(lines)
 
 
 @st.fragment(run_every=3)
 def _render_job_live():
-    """任务运行中每 3 秒轮询 radar_job.json 刷新进度；检测到结束后触发整页 rerun。"""
-    job = _read_job() or {}
-    st.info(f"⏳ 自动任务进行中（{job.get('mode', '')}，开始于 {job.get('started', '—')}）。"
-            "进度实时落盘，可自由切换页面/刷新。")
-    _render_job_steps(job.get("steps", []))
+    """任务运行中每 3 秒轮询 radar_job.json 刷新进度。
+    固定挂载 + 纯文本单元素渲染（st.text 原地更新，无 HTML 重解析），
+    结束边沿按 started 时间戳去重、只触发一次整页 rerun。"""
+    job = _read_job()
+    if not job:
+        return
+    if job.get("status") == "running" and not _job_running():
+        return  # 线程不在（中断/重启）：交给主流程的中断提示分支
     if job.get("status") != "running":
-        st.rerun()  # 整页 rerun，由主流程展示最终结果
+        token = job.get("started", "")
+        if st.session_state.get("_live_fired_radar") != token:
+            st.session_state["_live_fired_radar"] = token
+            st.rerun()  # 整页 rerun，由主流程展示最终结果
+        return
+    banner = (f"⏳ 自动任务进行中（{job.get('mode', '')}，开始于 {job.get('started', '—')}）。"
+              "进度实时落盘，可自由切换页面/刷新。")
+    st.text(f"{banner}\n\n{_steps_text(job.get('steps', []))}")
 
 
 def _render_job_result(job):
     summary = job.get("summary") or {}
+    errors = summary.get("errors") or []
+    if job.get("no_search"):
+        # 厂家无联网搜索能力：雷达页显著报错，并指向设置页带 📡 标记的厂家
+        st.error(f"🚫 {errors[0] if errors else '当前 API 厂家未提供联网搜索功能，雷达不可用。'}"
+                 "支持搜索的厂家见设置页厂家下拉中带 📡 标记的选项。")
+        _render_job_steps(job.get("steps", []))
+        return
     results = summary.get("results", {})
     total = sum(results.values())
     n_vars = sum(c.get("variables", 0) for c in summary.get("cognition", {}).values())
@@ -149,7 +193,6 @@ def _render_job_result(job):
     else:
         st.error(f"上次自动任务失败（{job.get('finished', '—')}）")
     _render_job_steps(job.get("steps", []))
-    errors = summary.get("errors") or []
     if errors:
         st.warning("部分主题失败：" + "；".join(errors))
 
@@ -259,11 +302,15 @@ def _start_tech_job(target, args):
     global _tech_thread
     if _tech_job_running():
         return
-    # 主线程取好当前会话的 API Key 传给工作线程（线程内访问不了 session_state）
+    # 主线程取好当前会话的 API Key、模型与端点传给工作线程（线程内访问不了 session_state）
     api_key = llm.get_api_key()
+    model = llm.get_model()
+    base_url = llm.get_base_url()
 
     def _wrapped():
         llm.set_thread_api_key(api_key)
+        llm.set_thread_model(model)
+        llm.set_thread_base_url(base_url)
         target(*args)
 
     _tech_thread = threading.Thread(target=_wrapped, daemon=True)
@@ -272,23 +319,31 @@ def _start_tech_job(target, args):
 
 @st.fragment(run_every=3)
 def _render_tech_job_live():
-    """提取/合并进行中每 3 秒轮询 tech_job.json 刷新进度；检测到结束后触发整页 rerun。"""
-    job = _read_tech_job() or {}
+    """提取/合并进行中每 3 秒轮询 tech_job.json 刷新进度。
+    固定挂载 + 单元素渲染（整段状态合成一段 HTML，只更新不增删节点），
+    结束边沿按 started 时间戳去重、只触发一次整页 rerun。"""
+    job = _read_tech_job()
+    if not job:
+        return
+    if job.get("status") == "running" and not _tech_job_running():
+        return  # 线程不在（中断/重启）：交给主流程的中断提示分支
+    if job.get("status") != "running":
+        token = job.get("started", "")
+        if st.session_state.get("_live_fired_radar_tech") != token:
+            st.session_state["_live_fired_radar_tech"] = token
+            st.rerun()  # 整页 rerun，由主流程消费结果
+        return
     label = "合并入库" if job.get("phase") == "merge" else "提取"
-    st.info(f"⏳ 技术{label}进行中（开始于 {job.get('started', '—')}）。"
-            "进度实时落盘，可自由切换页面/刷新。")
+    banner = (f"⏳ 技术{label}进行中（开始于 {job.get('started', '—')}）。"
+              "进度实时落盘，可自由切换页面/刷新。")
     lines = []
     for s in job.get("steps", []):
         icon = _STATUS_ICON.get(s.get("status"), "")
         detail = ""
         if s.get("detail") and s.get("status") != "running":
-            detail = f"（{html.escape(str(s['detail'])[:120])}）"
-        lines.append(f"{icon} {html.escape(str(s.get('title', '')))} {detail}")
-    if lines:
-        st.markdown("<div class='caption'>" + "<br>".join(lines) + "</div>",
-                    unsafe_allow_html=True)
-    if job.get("status") != "running":
-        st.rerun()  # 整页 rerun，由主流程消费结果
+            detail = f"（{str(s['detail'])[:120]}）"
+        lines.append(f"{icon} {s.get('title', '')} {detail}")
+    st.text(f"{banner}\n\n" + "\n".join(lines))
 
 
 # ==================== 存储 ====================
@@ -456,8 +511,9 @@ def render_radar(index, on_saved):
             st.rerun()
 
         job = _read_job()
+        _render_job_live()  # 固定挂载，内部按状态决定是否渲染
         if running:
-            _render_job_live()
+            pass
         elif job and job.get("status") == "running":
             # 任务文件仍是 running 但线程已不在：应用曾被重启/进程被杀，任务中断
             st.warning("上次自动任务被中断（应用重启或进程退出），结果可能不完整，可重新发起。")
@@ -530,8 +586,8 @@ def render_radar(index, on_saved):
             refresh = st.button("🔄 更新认知", help="基于该主题近 7 天信号重新生成叙事与边际变量")
         if refresh:
             if not llm.get_api_key():
-                st.warning("未填入 Moonshot API Key，无法更新认知："
-                           "请先在左侧边栏「API Key」处填入你自己的 key（sk-...）。")
+                st.warning("未填入 API Key，无法更新认知："
+                           "请先在左侧边栏「API 设置」处填入你自己的 key（sk-...）。")
             else:
                 with st.spinner(f"正在更新「{theme}」认知…"):
                     res = radar_auto.update_cognition(theme)
@@ -656,8 +712,9 @@ def render_radar(index, on_saved):
                 st.rerun()
 
         tjob = _read_tech_job()
+        _render_tech_job_live()  # 固定挂载，内部按状态决定是否渲染
         if tech_running:
-            _render_tech_job_live()
+            pass
         elif tjob and tjob.get("status") == "running":
             # 任务文件仍是 running 但线程已不在：应用曾被重启/进程被杀，任务中断
             st.warning("上次技术任务被中断（应用重启或进程退出），结果可能不完整，可重新发起。")

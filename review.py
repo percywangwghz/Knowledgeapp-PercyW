@@ -8,6 +8,7 @@
 - 确认后同时写回两个文档：项目文档追加/替换「## 🧭 行业总文档评审」节；
   行业总文档更新 项目落位表 / 关键变量演进表 / N.3 新项目评审留档 / 头部更新日期。
 """
+import html
 import json
 import os
 import re
@@ -18,7 +19,8 @@ from datetime import datetime
 import streamlit as st
 
 from config import KNOWLEDGE_DIR
-from llm import chat, get_api_key, set_thread_api_key
+from llm import (chat, get_api_key, get_base_url, get_model,
+                 set_thread_api_key, set_thread_base_url, set_thread_model)
 
 TRUNCATE = 8000
 
@@ -109,6 +111,10 @@ _job_thread = None  # 后台评审线程（模块级，跨 rerun 存活）
 _job_key = ""       # 当前线程服务的「项目|行业」组合
 
 JOB_STALE_SECS = 120  # job 文件超过该时长未更新且线程已死 → 判定中断
+PARTIAL_THROTTLE = 0.8  # 打字机 partial 落盘节流（秒）：距上次落盘不足此间隔只更新内存
+                        # （SSE chunk 太密，每片都写盘会抖，Windows 上还会撞句柄重试——对齐 ingest）
+PARTIAL_TAIL = 800      # 打字机显示的 partial 末尾截取长度（字符）：草稿是 JSON 流，
+                        # 全量当 markdown 渲染会被未闭合括号搅乱且越滚越慢
 
 
 def _job_key_of(project_doc, industry_doc):
@@ -161,18 +167,26 @@ def _job_stale(job):
     return age > JOB_STALE_SECS
 
 
-def _job_worker(project_doc, industry_doc, key, api_key):
-    """后台线程体：调 chat 生成评审草稿，partial 逐 chunk 写 job 文件。
+def _job_worker(project_doc, industry_doc, key, api_key, model=None, base_url=None):
+    """后台线程体：调 chat 生成评审草稿，partial 经节流实时写 job 文件（打字机显示）。
     注意：线程内没有 ScriptRunContext，禁止调用任何 st.*；
-    前端注入的 API Key 同样取不到，由 api_key 参数显式带入。"""
+    前端注入的 API Key、模型与端点同样取不到，由 api_key/model/base_url 参数显式带入。"""
     set_thread_api_key(api_key)
+    set_thread_model(model)
+    set_thread_base_url(base_url)
     state = {"status": "running", "key": key, "partial": "", "data": None, "error": "",
              "started": datetime.now().isoformat(timespec="seconds"),
              "finished": ""}
+    last_flush = [0.0]  # 上次 partial 落盘时刻（monotonic）
 
     def on_chunk(accumulated):
         state["partial"] = accumulated
-        _write_job(state)
+        # 每个 chunk 只更新内存，距上次落盘超过节流间隔才写盘；
+        # 最终 done/error 状态在下面无条件落盘，不会丢末尾
+        now = time.monotonic()
+        if now - last_flush[0] >= PARTIAL_THROTTLE:
+            last_flush[0] = now
+            _write_job(state)
 
     _write_job(state)
     try:
@@ -194,22 +208,41 @@ def _start_job(project_doc, industry_doc):
     if _thread_alive():
         return False
     _job_key = _job_key_of(project_doc, industry_doc)
-    # 主线程取好当前会话的 API Key 传给工作线程（线程内访问不了 session_state）
+    # 主线程取好当前会话的 API Key、模型与端点传给工作线程（线程内访问不了 session_state）
     _job_thread = threading.Thread(
-        target=_job_worker, args=(project_doc, industry_doc, _job_key, get_api_key()),
+        target=_job_worker, args=(project_doc, industry_doc, _job_key, get_api_key(),
+                                  get_model(), get_base_url()),
         daemon=True)
     _job_thread.start()
     return True
 
 
 @st.fragment(run_every=2)
-def _render_job_live():
-    """轮询 job 文件，打字机式显示生成中的评审草稿；结束/失败后整页 rerun。"""
-    job = _read_job() or {}
-    partial = job.get("partial", "")
-    st.markdown(partial + " ▌" if partial else "🔮 AI 正在阅读两份文档……")
+def _render_job_live(key):
+    """轮询 job 文件，打字机式显示生成中的评审草稿。
+    固定挂载（内部按状态决定是否渲染），结束/失败边沿按 started 时间戳去重、
+    只触发一次整页 rerun——避免条件挂载的卸载与整页 rerun 撞车导致前端 DOM 错位。
+    key 为当前选中的「项目|行业」组合：任务属于其他组合时不渲染（主流程已有
+    「另一组任务运行中」提示），打字机不串台，也不为无关任务触发整页 rerun。"""
+    job = _read_job()
+    if not job:
+        return
+    if job.get("key") != key:
+        return  # 属于其他项目/行业组合：done 结果留给切回该组合时的主流程消费
+    if job.get("status") == "running" and not _thread_alive():
+        return  # 线程不在（中断/重启）：交给主流程的中断提示分支
     if job.get("status") != "running":
-        st.rerun()  # 整页 rerun，由主流程落草稿/报错
+        token = job.get("started", "")
+        if st.session_state.get("_live_fired_review") != token:
+            st.session_state["_live_fired_review"] = token
+            st.rerun()  # 整页 rerun，由主流程落草稿/报错
+        return
+    partial = job.get("partial", "")
+    # 纯文本渲染 + 末尾截断：st.text 原地更新单个文本节点，无 markdown/HTML 重解析、
+    # 无子节点增删（removeChild 崩溃的根源）；草稿是 JSON 流，截尾避免越绘越慢；
+    # 完成后的正式草稿由主流程一次性渲染
+    tail = partial[-PARTIAL_TAIL:] if partial else "🔮 AI 正在阅读两份文档……"
+    st.text(tail + (" ▌" if partial else ""))
 
 
 def _default_industry_idx(project_doc, industries):
@@ -388,8 +421,8 @@ def render_review(index, on_saved):
 
     has_key = bool(get_api_key())
     if not has_key:
-        st.warning("未填入 Moonshot API Key，AI 功能不可用："
-                   "请先在左侧边栏「API Key」处填入你自己的 key（sk-...）。")
+        st.warning("未填入 API Key，AI 功能不可用："
+                   "请先在左侧边栏「API 设置」处填入你自己的 key（sk-...）。")
 
     deals = [d for d in index.get("documents", []) if d.get("category_key") == "02_deals"]
     if not deals:
@@ -459,8 +492,8 @@ def render_review(index, on_saved):
             st.session_state.review_flash = "评审草稿已生成，请审阅后确认写回。"
             _remove_job()
             st.rerun()
-        else:
-            _remove_job()  # 属于其他项目/行业组合，丢弃
+        # key 不匹配的 done 结果不丢弃：留在 job 文件里，切回对应组合时落草稿
+        # （生成中切换项目/行业选择是常态，一切就丢草稿等于白跑；下次启动新任务会覆盖）
         job = None
 
     # ---- 生成草稿（后台线程，不阻塞 rerun）----
@@ -470,14 +503,13 @@ def render_review(index, on_saved):
         _start_job(pdoc, indoc)
         st.rerun()
 
+    _render_job_live(key)  # 固定挂载，内部按状态决定是否渲染
     if job and job.get("status") == "running":
         if _job_stale(job):
             st.warning("评审任务被中断（应用重启或进程退出），请重新生成。")
             _remove_job()
             job = None
-        elif job.get("key") == key:
-            _render_job_live()
-        else:
+        elif job.get("key") != key:
             st.info("另一组项目/行业的评审任务正在后台运行……")
     elif job and job.get("status") == "error":
         # 失败保留现场：不清草稿、只报错，可直接重新生成

@@ -179,7 +179,7 @@ print("[OK]   api-key injection")
 # 10b. app.py 侧边栏 API Key 输入框 → 写入 session_state + 本机持久化文件
 at = run_view("home")
 if not at.exception:
-    ti = next((t for t in at.text_input if t.label == "Moonshot API Key"), None)
+    ti = next((t for t in at.text_input if t.label == "API Key"), None)
     assert ti is not None, "sidebar api-key input missing"
     ti.set_value("sk-friend-demo").run()
     assert at.session_state.user_api_key == "sk-friend-demo", \
@@ -199,6 +199,37 @@ if not at.exception:
     print("[OK]   key persistence across sessions")
 if os.path.exists(KEY_FILE):
     os.remove(KEY_FILE)
+
+# 11. 本地图片内联（mdblocks.inline_local_images，纯函数直测）：
+# 相对路径图片 → base64 data URI；含括号目录名不截断；网络图/缺失文件原样保留
+import mdblocks
+
+_tmp_kb = tempfile.mkdtemp()
+_doc_dir = os.path.join(_tmp_kb, "08_funds")
+_img_dir = os.path.join(_tmp_kb, "assets", "img", "D(1)")
+os.makedirs(_doc_dir)
+os.makedirs(_img_dir)
+# 1x1 PNG
+_png = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82")
+with open(os.path.join(_img_dir, "p3_1.png"), "wb") as f:
+    f.write(_png)
+_md = ("## 图集\n\n![p.3 图表](../assets/img/D(1)/p3_1.png)\n\n"
+       "![网图](https://x.com/a.png)\n\n![缺失](../assets/img/D(1)/none.png)")
+_out = mdblocks.inline_local_images(_md, _doc_dir)
+assert "![p.3 图表](data:image/png;base64," in _out, "local image not inlined"
+assert "![网图](https://x.com/a.png)" in _out, "remote image should stay as-is"
+assert "![缺失](../assets/img/D(1)/none.png)" in _out, "missing file should stay as-is"
+print("[OK]   local image inlining")
+
+# 12. 折叠块拆分（split_details_blocks）：原文全文不进目录、正文后单独渲染
+_md2 = "# T\n\n## 一\n正文\n\n<details><summary>原文全文</summary>\n\n## 原始目录\n原文\n\n</details>\n"
+_main, _blocks = mdblocks.split_details_blocks(_md2)
+assert "## 原始目录" not in _main and len(_blocks) == 1 and "## 原始目录" in _blocks[0], \
+    f"main={_main!r} blocks={_blocks!r}"
+assert "## 一" in _main, "正文标题应保留"
+print("[OK]   details blocks split")
 
 print()
 if failures:

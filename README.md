@@ -23,6 +23,12 @@ python3 -m venv .venv
 [Moonshot API Key](https://platform.moonshot.cn)。Key 只保存在你自己机器上，
 谁使用谁出额度；不填也能浏览文档，只是 AI 功能不可用。
 
+**PDF 高保真解析需配置多模态模型**（如 kimi-k2.6 / qwen-vl-max / glm-4.6v / gpt-4o 等，
+在侧边栏「API 设置」选择厂家与模型）：配置后 PDF 逐块渲染成图、走你自己的 API 转录为
+Markdown（表格/标题/图表解读/公式齐全，成本随页数线性增长）；模型不支持视觉或未填 Key 时
+自动落本地库链（pymupdf4llm → pdfplumber → pypdf），纯文字 PDF 也能入库，但扫描件与
+复杂版面会降质。详见 `skills/pdf-preprocess/SKILL.md`。
+
 ## 知识库目录
 
 应用启动时自动读取**应用所在目录下的 `knowledge/` 文件夹**，无需任何路径配置——

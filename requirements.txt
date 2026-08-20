@@ -6,3 +6,5 @@ openpyxl==3.1.5
 beautifulsoup4==4.15.0
 lxml==6.1.1
 markdown==3.10.2
+pymupdf4llm==1.28.2
+pdfplumber==0.11.10

@@ -2,7 +2,7 @@
 """
 Investment Radar 自动抓取 + 认知更新模块（可独立 CLI 运行）。
 
-阶段一（抓取）：用 Moonshot $web_search 按 watchlist 抓近 7 天信息，
+阶段一（抓取）：用厂家原生联网搜索按 watchlist 抓近 7 天信息，
   进信号池 radar_signals.json（带 "auto": true，含 sub_track/companies 字段）。
 阶段二（认知）：基于近 7 天信号池自动更新主题叙事（radar_themes.json）
   并提炼边际变量（radar_variables.json，带 "auto": true）。
@@ -23,7 +23,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
-from llm import NoApiKeyError, chat, chat_with_search, get_api_key, set_thread_api_key
+from llm import (NoApiKeyError, SearchNotSupportedError, chat, chat_with_search,
+                 get_api_key, get_base_url, get_model, set_thread_api_key,
+                 set_thread_base_url, set_thread_model)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
@@ -97,7 +99,7 @@ SYSTEM_PROMPT = """你是 Investment Radar 的信息采集员，为一级市场�
 - 区分事实与解释：summary 写发生了什么（事实），why 写为什么可能改变市场认知（解释）。
 - 每条信息必须能回答"它可能改变市场对什么的理解"，答不上来的不要收。
 
-请用 $web_search 搜索后，输出严格 JSON 数组（不要输出任何其他文字），最多 {max_items} 条，每条字段：
+请使用联网搜索能力搜索后，输出严格 JSON 数组（不要输出任何其他文字），最多 {max_items} 条，每条字段：
 - date: 事件发生日期，"YYYY-MM-DD"
 - source_type: 三选一 ["产业信息", "资本信息", "投资人观点"]
 - theme: 固定填 "{theme}"
@@ -305,8 +307,8 @@ def _fetch_one_query(theme, query, focus="", thinking=True):
         stat = {"q": query, "n": 0, "raw": f"ERROR: {e}"[:150]}
         _FETCH_STATS.setdefault(theme, []).append(stat)
         _debug_write({"theme": theme, "titles": [], **stat})
-        if isinstance(e, NoApiKeyError):
-            raise  # 无 key 是全局性失败，不能吞掉伪装成「+0 成功」
+        if isinstance(e, (NoApiKeyError, SearchNotSupportedError)):
+            raise  # 无 key / 厂家无搜索能力是全局性失败，不能吞掉伪装成「+0 成功」
         return []
     items = parse_items(raw, theme, limit=MAX_PER_QUERY)
     stat = {"q": query, "n": len(items), "raw": raw[:150] if not items else ""}
@@ -443,13 +445,17 @@ def run(primary_only=False, dry_run=False, do_fetch=True, do_cognition=True, pro
         themes = [t for t in themes if t.get("theme") == only]
     results, cognition, errors = {}, {}, []
     _FETCH_STATS.clear()
-    # 并行 worker 线程内取不到前端会话注入的 key（无 ScriptRunContext），
-    # 在本线程取好后逐个注入
+    # 并行 worker 线程内取不到前端会话注入的 key/模型/端点（无 ScriptRunContext，
+    # threading.local 也按线程隔离），在本线程取好后逐个注入
     api_key = get_api_key()
+    model = get_model()
+    base_url = get_base_url()
 
     def _with_key(fn, *args):
         if api_key:
             set_thread_api_key(api_key)
+        set_thread_model(model)
+        set_thread_base_url(base_url)  # 缺了它自定义厂家会错落到默认 Moonshot 端点
         return fn(*args)
 
     def _report(stage, theme, status, detail=""):
@@ -483,6 +489,9 @@ def run(primary_only=False, dry_run=False, do_fetch=True, do_cognition=True, pro
                 theme = futures[fut]
                 try:
                     _, items = fut.result()
+                except SearchNotSupportedError:
+                    raise  # 厂家无搜索能力是全局性失败：所有主题同样失败，
+                           # 直接终止任务，交给 UI 明确提示（不逐主题吞掉）
                 except Exception as e:  # 单主题失败不中断整体
                     results[theme] = 0
                     errors.append(f"抓取-{theme}: {e}")

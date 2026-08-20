@@ -15,8 +15,9 @@ import streamlit.components.v1 as components
 
 import llm
 from battle import render_battle
+from config import PROVIDERS
 from ingest import render_ingest
-from mdblocks import wrap_ascii_tables
+from mdblocks import wrap_ascii_tables, inline_local_images, split_details_blocks
 from review import render_review
 from radar import render_radar
 from tracks import STATUS_BUCKETS, get_track, normalize_status
@@ -28,7 +29,22 @@ def _frontend_api_key():
     return st.session_state.get("user_api_key", "").strip()
 
 
+def _frontend_model():
+    """返回当前会话配置的模型名（空串 = 未配置，llm 侧落厂家预设默认模型）。"""
+    return st.session_state.get("user_model", "").strip()
+
+
+def _frontend_base_url():
+    """返回当前会话厂家对应的 API 端点；自定义/无官方兼容端点的厂家取手填值。"""
+    pid = st.session_state.get("user_provider", "moonshot")
+    if pid in ("custom", "anthropic"):
+        return st.session_state.get("user_base_url", "").strip()
+    return (PROVIDERS.get(pid) or {}).get("base_url", "")
+
+
 llm.register_key_provider(_frontend_api_key)
+llm.register_model_provider(_frontend_model)
+llm.register_base_url_provider(_frontend_base_url)
 
 # ==================== 配置区域 ====================
 
@@ -48,26 +64,41 @@ INDEX_FILE = os.path.join(DATA_DIR, "kb_index.json")
 # ⚠️ 外发打包前必须删除此文件，里面是本机填过的 key）
 LOCAL_KEY_FILE = os.environ.get("KB_LOCAL_KEY_FILE",
                                 os.path.join(DATA_DIR, "local_api_key.txt"))
+# 厂家 / 模型 / 自定义端点同样持久化到本机（同 local_api_key.txt 模式，env 可覆盖路径）
+LOCAL_PROVIDER_FILE = os.environ.get("KB_LOCAL_PROVIDER_FILE",
+                                     os.path.join(DATA_DIR, "local_provider.txt"))
+LOCAL_MODEL_FILE = os.environ.get("KB_LOCAL_MODEL_FILE",
+                                  os.path.join(DATA_DIR, "local_model.txt"))
+LOCAL_BASE_URL_FILE = os.environ.get("KB_LOCAL_BASE_URL_FILE",
+                                     os.path.join(DATA_DIR, "local_base_url.txt"))
 
 
-def _load_local_key():
+def _load_local(path):
     try:
-        with open(LOCAL_KEY_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
     except OSError:
         return ""
 
 
-def _save_local_key(key):
+def _save_local(path, value):
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        if key:
-            with open(LOCAL_KEY_FILE, "w", encoding="utf-8") as f:
-                f.write(key)
-        elif os.path.exists(LOCAL_KEY_FILE):
-            os.remove(LOCAL_KEY_FILE)
+        if value:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(value)
+        elif os.path.exists(path):
+            os.remove(path)
     except OSError:
         pass
+
+
+def _load_local_key():
+    return _load_local(LOCAL_KEY_FILE)
+
+
+def _save_local_key(key):
+    _save_local(LOCAL_KEY_FILE, key)
 
 CATEGORY_MAP = {
     "01_industry": ("行业认知", "🏭", "二级框架：赛道全景、产业链、投资逻辑"),
@@ -422,6 +453,65 @@ st.markdown("""
     .main-header { font-size: 1.6rem; font-weight: 700; color: var(--kb-text); letter-spacing: -0.01em; }
     .sub-header { font-size: 0.85rem; color: var(--kb-text-3); margin-bottom: 1.2rem; }
 
+    /* ---------- 顶部导航：真 Streamlit 按钮以 fixed 浮层挂到顶栏一行（纯 CSS，无 JS） ---------- */
+    header[data-testid="stHeader"] { background-color: var(--kb-bg); }
+    div[data-testid="stLayoutWrapper"]:has(.topnav-marker) {
+        position: fixed;
+        top: 0;
+        left: 21rem;            /* 侧栏展开宽度，从主区左缘起 */
+        right: 12rem;           /* 给右上角 部署/菜单 按钮留位 */
+        width: auto !important; /* Streamlit 默认 width:100%，fixed 下会溢出右缘 */
+        z-index: 1000000;       /* stToolbar z-index 999990 铺满顶栏，必须盖过它才能点到 */
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        padding: 0;
+    }
+    /* 侧栏收起时左移，但给「展开侧栏」按钮留位 */
+    div[data-testid="stApp"]:has(section[data-testid="stSidebar"][aria-expanded="false"])
+    div[data-testid="stLayoutWrapper"]:has(.topnav-marker) {
+        left: 3rem;
+    }
+    /* 带边框容器的边框/圆角/白底在内层 stVerticalBlock 上，一并抹掉 */
+    div[data-testid="stLayoutWrapper"]:has(.topnav-marker) > div[data-testid="stVerticalBlock"] {
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        padding: 0.9rem 0.75rem 0.2rem;   /* 实测对齐：按钮文字中线与「部署」同高 */
+        gap: 0;
+    }
+    /* marker 占位元素本身不显示，避免撑高顶栏 */
+    div[data-testid="stElementContainer"]:has(.topnav-marker) { display: none; }
+    /* 导航按钮做成链接样式：无边框透明底，当前页主题色加粗 + 高亮小区块 */
+    div[data-testid="stLayoutWrapper"]:has(.topnav-marker) .stButton button {
+        border: none !important;
+        background: transparent !important;
+        box-shadow: none !important;
+        color: var(--kb-text) !important;
+        font-size: 1.05rem;
+        padding: 0.3rem 0.5rem;
+        min-height: 0;
+        border-radius: 8px !important;
+    }
+    div[data-testid="stLayoutWrapper"]:has(.topnav-marker) .stButton button:hover {
+        color: var(--kb-accent) !important;
+        background: rgba(59,110,165,0.07) !important;
+    }
+    div[data-testid="stLayoutWrapper"]:has(.topnav-marker) .stButton button[kind="primary"] {
+        color: var(--kb-accent) !important;
+        font-weight: 700;
+        background: rgba(59,110,165,0.12) !important;
+        box-shadow: 0 1px 3px rgba(59,110,165,0.18) !important;
+    }
+    /* 导航条左侧品牌名 */
+    .topnav-brand {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: var(--kb-text);
+        line-height: 1.9rem;
+        white-space: nowrap;
+    }
+
     /* ---------- 节标题 ---------- */
     .section-header { font-size: 1.1rem; font-weight: 700; color: var(--kb-text); margin: 1.6rem 0 0.8rem 0; }
 
@@ -434,6 +524,21 @@ st.markdown("""
     div[data-testid="stTextInput"] input:focus {
         border-color: var(--kb-accent);
         box-shadow: 0 0 0 3px rgba(59,110,165,0.15);
+    }
+
+    /* ---------- 文件归档页：上传白框包住整个 uploader（含"每个文件200MB…"限制说明行） ---------- */
+    div[data-testid="stFileUploader"] {
+        background-color: var(--kb-card);
+        border: 1px solid var(--kb-border);
+        border-radius: var(--kb-radius);
+        padding: 1rem 1.2rem 0.9rem;
+        box-shadow: var(--kb-shadow);
+    }
+    div[data-testid="stFileUploader"] section {
+        background-color: transparent;
+    }
+    div[data-testid="stFileUploader"] small {
+        color: var(--kb-text-3);
     }
 
     /* ---------- 卡片容器（bordered container 统一卡片化） ---------- */
@@ -521,9 +626,18 @@ st.markdown("""
         display: block; color: var(--kb-text-2); font-size: 0.82rem;
         padding: 0.15rem 0; text-decoration: none;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        transition: color .15s ease, background .15s ease;
     }
     .toc-link:hover { color: var(--kb-accent); }
     .toc-h3 { padding-left: 1rem; font-size: 0.78rem; color: var(--kb-text-3); }
+    /* 滚动监听高亮：当前视口内标题对应的目录项（JS 逐帧切换 .active）；
+       负外边距抵消新增内边距，高亮出现时文字不位移 */
+    .toc-link.active {
+        color: var(--kb-accent); font-weight: 600;
+        background: rgba(76, 139, 245, 0.10); border-radius: 4px;
+        margin-left: -0.45rem; padding-left: 0.45rem; padding-right: 0.45rem;
+    }
+    .toc-link.toc-h3.active { padding-left: calc(1rem + 0.45rem); }
 
     /* ---------- 上一篇/下一篇 & 回到顶部 ---------- */
     .pn-label { color: var(--kb-text-3); font-size: 0.78rem; margin-bottom: 0.1rem; }
@@ -664,6 +778,17 @@ if "selected_category" not in st.session_state:
 # 启动时载入本机持久化的 API Key（填一次，之后自动生效）
 if "user_api_key" not in st.session_state:
     st.session_state.user_api_key = _load_local_key()
+
+# 启动时载入本机持久化的厂家/模型/自定义端点（同上，填一次自动生效）
+if "user_provider" not in st.session_state:
+    _p = _load_local(LOCAL_PROVIDER_FILE)
+    st.session_state.user_provider = _p if _p in PROVIDERS else "moonshot"
+
+if "user_model" not in st.session_state:
+    st.session_state.user_model = _load_local(LOCAL_MODEL_FILE)
+
+if "user_base_url" not in st.session_state:
+    st.session_state.user_base_url = _load_local(LOCAL_BASE_URL_FILE)
 
 
 def format_size(size_bytes):
@@ -992,8 +1117,14 @@ def render_document_detail(doc):
         if lines and lines[0].strip().startswith("# "):
             content = "\n".join(lines[1:]).lstrip("\n")
         if content:
+            # 本地图集引用（../assets/img/…）内联成 base64：浏览器解析不到应用外的
+            # 相对路径，直接渲染会破图；含括号的目录名也会截断 markdown 图片语法
+            content = inline_local_images(
+                content, os.path.dirname(os.path.join(KNOWLEDGE_DIR, doc["path"])))
             content = wrap_ascii_tables(content)  # 纯文字/ASCII 表格包成围栏，等宽渲染
-            sections, _ = parse_sections(content)
+            # <details> 折叠块（原文全文）抽出：其标题不进目录，正文后单独渲染
+            content_main, details_blocks = split_details_blocks(content)
+            sections, _ = parse_sections(content_main)
             for sec in sections:
                 if sec.startswith('<a id="'):
                     cut = sec.index("</a>") + 4
@@ -1001,6 +1132,8 @@ def render_document_detail(doc):
                     st.markdown(sec[cut:])
                 else:
                     st.markdown(sec)
+            for blk in details_blocks:
+                st.markdown(blk, unsafe_allow_html=True)
         else:
             st.warning("文档内容为空")
 
@@ -1058,6 +1191,30 @@ def render_document_detail(doc):
 
 # ==================== 主界面 ====================
 
+# ---- 顶部导航：真 Streamlit 按钮，纯 CSS fixed 浮到顶栏那一行（无 JS 注入）----
+# 导航条容器靠 CSS :has(.topnav-marker) 定位并 fixed 到顶栏；首页高亮覆盖浏览类子视图。
+_TOP_NAV = [("home", "首页", {"selected_doc": None, "selected_category": None}),
+            ("battle", "论文之战", {"selected_doc": None}),
+            ("radar", "投资雷达", {"selected_doc": None}),
+            ("compare", "新项目评审", {"selected_doc": None}),
+            ("ingest", "文件归档", {"selected_doc": None})]
+_BROWSE_MODES = {"home", "category", "search", "doc"}
+with st.container(border=True):
+    st.markdown('<div class="topnav-marker"></div>', unsafe_allow_html=True)
+    # 尾部空列把按钮组顶到品牌名一侧，而不是铺满整条顶栏
+    _brand_col, *_nav_cols = st.columns([1.7] + [0.75] * len(_TOP_NAV) + [2.2])
+    with _brand_col:
+        st.markdown('<div class="topnav-brand">🧠 一级投研知识库</div>', unsafe_allow_html=True)
+    for _col, (_mode, _label, _extra) in zip(_nav_cols[:-1], _TOP_NAV):
+        with _col:
+            _active = (st.session_state.view_mode == _mode
+                       or (_mode == "home" and st.session_state.view_mode in _BROWSE_MODES))
+            if st.button(_label, key=f"topnav_{_mode}", use_container_width=True,
+                         type="primary" if _active else "secondary"):
+                st.session_state.view_mode = _mode
+                st.session_state.update(_extra)
+                st.rerun()
+
 if st.session_state.view_mode == "home":
     st.markdown('<div class="main-header">🧠 一级投研知识库</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-header">沉淀认知 · 关联洞察 · 复用框架</div>', unsafe_allow_html=True)
@@ -1090,47 +1247,56 @@ if st.session_state.view_mode in ("home", "search"):
 
 # 侧边栏
 with st.sidebar:
-    sidebar_section("导航")
-
-    if st.button("🏠 首页", use_container_width=True):
-        st.session_state.view_mode = "home"
-        st.session_state.selected_doc = None
-        st.session_state.selected_category = None
-        st.rerun()
-
-    if st.button("⚔️ Thesis Battle", use_container_width=True):
-        st.session_state.view_mode = "battle"
-        st.session_state.selected_doc = None
-        st.rerun()
-
-    if st.button("📡 Investment Radar", use_container_width=True):
-        st.session_state.view_mode = "radar"
-        st.session_state.selected_doc = None
-        st.rerun()
-
-    if st.button("🧭 新项目评审", use_container_width=True):
-        st.session_state.view_mode = "compare"
-        st.session_state.selected_doc = None
-        st.rerun()
-
-    if st.button("📥 文件归档", use_container_width=True):
-        st.session_state.view_mode = "ingest"
-        st.session_state.selected_doc = None
-        st.rerun()
-
-    st.divider()
-
-    sidebar_section("API Key")
+    sidebar_section("API 设置")
+    st.selectbox(
+        "API 厂家",
+        list(PROVIDERS.keys()),
+        format_func=lambda pid: ("📡 " if PROVIDERS[pid].get("search") is not None else "")
+                                + PROVIDERS[pid]["label"],
+        key="user_provider",
+        help="选择你的 key 所属厂家，端点与推荐模型自动带出；"
+             "代理/中转站或未收录厂家选「自定义」。"
+             "带 📡 标记的厂家提供联网搜索，雷达功能可用。",
+    )
+    _preset = PROVIDERS.get(st.session_state.user_provider, {})
+    if st.session_state.user_provider in ("custom", "anthropic"):
+        # 自定义厂家 / 官方无 OpenAI 兼容端点（Anthropic）：Base URL 需手填
+        st.text_input(
+            "Base URL",
+            key="user_base_url",
+            placeholder="https://...（OpenAI 兼容端点）",
+        )
+    else:
+        st.caption(f"端点：`{_preset.get('base_url', '')}`")
+    if _preset.get("note"):
+        st.caption(f"💡 {_preset['note']}")
     st.text_input(
-        "Moonshot API Key",
+        "模型",
+        key="user_model",
+        placeholder=_preset.get("default_model") or "模型名",
+        help="留空则使用该厂家的预设默认模型。",
+    )
+    if not _preset.get("vision", True):
+        st.caption("⚠️ 该模型不含视觉能力，PDF 高保真解析将使用本地引擎")
+    st.text_input(
+        "API Key",
         type="password",
         key="user_api_key",
         placeholder="sk-...（必填，否则 AI 功能不可用）",
-        help="填入你自己的 Moonshot API Key 后，Thesis Battle / Radar / 评审等 AI 功能"
+        help="填入你自己的 API Key 后，Thesis Battle / Radar / 评审等 AI 功能"
              "自动走你的 key 计费。只需填一次：key 会保存在本机 data/local_api_key.txt，"
              "之后每次打开自动生效；清空输入框即删除本机保存的 key。",
         label_visibility="collapsed",
     )
+    # 填入/修改/清空 → 同步本机持久化
+    for _key, _file in (("user_provider", LOCAL_PROVIDER_FILE),
+                        ("user_model", LOCAL_MODEL_FILE),
+                        ("user_base_url", LOCAL_BASE_URL_FILE)):
+        _v = st.session_state.get(_key, "")
+        if isinstance(_v, str):
+            _v = _v.strip()
+        if _v != _load_local(_file):
+            _save_local(_file, _v)
     _cur_key = st.session_state.get("user_api_key", "").strip()
     if _cur_key != _load_local_key():
         _save_local_key(_cur_key)  # 填入/修改/清空 → 同步本机持久化
@@ -1171,13 +1337,93 @@ with st.sidebar:
     # 文档阅读模式下显示本页目录
     if st.session_state.view_mode == "doc" and st.session_state.selected_doc:
         sidebar_section("本页目录")
-        _, toc = parse_sections(st.session_state.selected_doc.get("content", ""))
+        # 剔除 <details> 折叠块（原文全文）：其标题是原始文档的目录，不是整理产物的章节
+        _, toc = parse_sections(split_details_blocks(
+            st.session_state.selected_doc.get("content", ""))[0])
         if toc:
             toc_html = "".join(
                 f"<a class='toc-link {'toc-h3' if level == 3 else 'toc-h2'}' href='#{anchor}'>{text}</a>"
                 for level, text, anchor in toc[:30]
             )
             st.markdown(toc_html, unsafe_allow_html=True)
+            # 目录滚动跟随：高亮当前阅读到的章节，并让目录自身滚动把高亮项保持在可见区
+            components.html(
+                """<script>
+(function () {
+  var P = window.parent, D = P.document;
+  if (P.__tocSpyCleanup) { try { P.__tocSpyCleanup(); } catch (e) {} }
+  var links = [], anchors = [], current = -1;
+
+  function collect() {
+    links = Array.prototype.slice.call(D.querySelectorAll('a.toc-link'));
+    anchors = links.map(function (l) {
+      var href = l.getAttribute('href') || '';
+      return href.charAt(0) === '#' ? D.getElementById(href.slice(1)) : null;
+    });
+    return links.length > 0 && anchors.some(Boolean);
+  }
+
+  function keepInView(link) {
+    if (!link) return;
+    var el = link.parentElement;
+    while (el && el !== D.body) {
+      var ov = P.getComputedStyle(el).overflowY;
+      if ((ov === 'auto' || ov === 'scroll') && el.scrollHeight > el.clientHeight + 4) {
+        var c = el.getBoundingClientRect(), r = link.getBoundingClientRect();
+        if (r.top < c.top + 48) el.scrollTop += (r.top - c.top) - 48;
+        else if (r.bottom > c.bottom - 48) el.scrollTop += (r.bottom - c.bottom) + 48;
+        return;
+      }
+      el = el.parentElement;
+    }
+  }
+
+  function update() {
+    // Streamlit 任意交互都重渲染主区 DOM（本组件 iframe 不变、脚本存活）：
+    // 旧节点引用随之失效——发现引用失效即重新收集，不依赖一次性就绪
+    if (!anchors.length || !D.contains(anchors[0]) || !D.contains(links[0])) {
+      current = -1;
+      if (!collect()) return;
+    }
+    // 阅读线定在视口顶部往下 140px（避开顶部固定导航）：最后一条越过阅读线的
+    // 标题即当前章节；还没翻到任何标题时高亮第一项
+    var idx = -1;
+    for (var i = 0; i < anchors.length; i++) {
+      var a = anchors[i];
+      if (a && a.getBoundingClientRect().top <= 140) idx = i;
+    }
+    if (idx < 0) idx = 0;
+    if (idx === current) return;
+    current = idx;
+    for (var j = 0; j < links.length; j++) links[j].classList.toggle('active', j === idx);
+    keepInView(links[idx]);
+  }
+
+  var scheduled = false;
+  function onScroll() {
+    if (scheduled) return;
+    scheduled = true;
+    P.requestAnimationFrame(function () { scheduled = false; update(); });
+  }
+
+  // 双通道：scroll 事件即时响应（rAF 节流）+ 常驻轮询自愈。
+  // 为什么必须有轮询：大文档 base64 图片渲染慢、布局随图片加载持续变化，
+  // 「等 DOM 就绪再挂监听」的模式在慢渲染下会超时放弃，高亮从此冻住；
+  // 轮询每次只读几个 getBoundingClientRect，开销可忽略，且任何重渲染后自动恢复。
+  P.addEventListener('scroll', onScroll, true);
+  P.addEventListener('resize', onScroll);
+  var timer = P.setInterval(update, 300);
+  update();
+
+  P.__tocSpyCleanup = function () {
+    P.clearInterval(timer);
+    P.removeEventListener('scroll', onScroll, true);
+    P.removeEventListener('resize', onScroll);
+  };
+})();
+</script>""",
+                height=0,
+            )
         else:
             st.markdown("<div class='meta-line'>本文档无章节标题</div>", unsafe_allow_html=True)
         st.divider()
