@@ -408,7 +408,7 @@ p = ingest.save_document(result, "来源.pdf")
 saved = open(p, encoding="utf-8").read()
 check("文末不带原文折叠段", "原文全文" not in saved and "全文内容" not in saved)
 
-# 入库图集段：暂存图搬进 knowledge/assets/img/，md 相对路径引用
+# 入库不再带文末图集：未被正文 [[图:…]] 引用的图（模型判为无关）不搬运、不入库
 orig_data2 = ingest.DATA_DIR
 ingest.DATA_DIR = tempfile.mkdtemp()
 stage = os.path.join(ingest.DATA_DIR, ingest.IMG_STAGE_DIR, ingest._slug("来源.pdf"))
@@ -421,14 +421,13 @@ res_img = {"file": "来源.pdf", "category_key": "01_industry", "title": "T",
 p = ingest.save_document(res_img, "来源.pdf")
 saved = open(p, encoding="utf-8").read()
 img_dst = os.path.join(config.KNOWLEDGE_DIR, "assets", "img", "图集测试", "p3_1.png")
-check("入库含图集段", "## 📷 其他图表" in saved
-      and "![p.3 图表](../assets/img/图集测试/p3_1.png)" in saved, f"saved={saved[-400:]!r}")
-check("图片搬进 assets 且暂存清空", os.path.isfile(img_dst)
-      and not os.path.exists(os.path.join(stage, "p3_1.png")))
-check("图集位于文末", saved.rstrip().endswith("p3_1.png)"))
+check("未引用图不进文档", "其他图表" not in saved and "p3_1.png" not in saved,
+      f"saved={saved[-400:]!r}")
+check("未引用图不搬入 assets 且暂存清空", not os.path.isfile(img_dst)
+      and not os.path.exists(stage))
 ingest.DATA_DIR = orig_data2
 
-# 占位符内联：被正文 [[图:…]] 引用的图落在相关小节，未引用的才进文末图集
+# 占位符内联：被正文 [[图:…]] 引用的图搬进 assets 并原地替换，未引用的直接丢弃
 ingest.DATA_DIR = tempfile.mkdtemp()
 stage = os.path.join(ingest.DATA_DIR, ingest.IMG_STAGE_DIR, ingest._slug("来源.pdf"))
 os.makedirs(stage)
@@ -443,8 +442,11 @@ p = ingest.save_document(res_tok, "来源.pdf")
 saved = open(p, encoding="utf-8").read()
 check("占位符原地替换", "分析![p.3 图表](../assets/img/占位测试/p3_1.png)" in saved,
       f"saved={saved[:400:]!r}")
-check("引用过的图不进图集", saved.count("p3_1.png") == 1
-      and "![p.7 图表](../assets/img/占位测试/p7_2.png)" in saved.split("其他图表")[-1])
+check("引用图搬入 assets", os.path.isfile(
+    os.path.join(config.KNOWLEDGE_DIR, "assets", "img", "占位测试", "p3_1.png")))
+check("未引用图不出现也不搬运", "p7_2.png" not in saved
+      and not os.path.isfile(os.path.join(config.KNOWLEDGE_DIR, "assets", "img",
+                                          "占位测试", "p7_2.png")))
 ingest.DATA_DIR = orig_data2
 
 # _analyze_one 留存全文 + PDF 解析说明

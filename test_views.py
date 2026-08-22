@@ -46,12 +46,12 @@ def run_view(name, state=None, keep_key_file=False):
 # 1. 首页
 at = run_view("home")
 if not at.exception:
-    # 顶部一行：知识库概览 / 本周 AI 花费 两个紧凑三行块 + 右侧按功能细分表格
+    # Hero：研究主页 eyebrow + 大标题 + mono 索引信息行
     md_text = "\n".join(m.value for m in at.markdown)
-    for t in ("知识库概览", "本周 AI 花费", "按功能细分"):
-        assert t in md_text, f"home stat block missing: {t}"
+    for t in ("研究主页", "一级投研知识库", "篇文档", "个合集", "索引于"):
+        assert t in md_text, f"home hero missing: {t}"
     assert len(at.metric) == 0, "home should use compact stat blocks, not big metric cards"
-    print("       stat blocks rendered")
+    print("       hero rendered")
 
 # 2. 分类页
 cat_key = next(iter(index["categories"]))
@@ -77,8 +77,10 @@ if not at.exception:
 # 6. Investment Radar
 at = run_view("radar", {"view_mode": "radar"})
 if not at.exception:
-    assert len(at.tabs) == 5, f"radar should have 5 tabs, got {len(at.tabs)}"
-    print("       radar tabs count:", len(at.tabs))
+    # 子导航是 st.button 文字 tab（非 st.tabs），6 个：总览/信号/主题/变量/报告/来源
+    radar_tabs = [b for b in at.button if (b.key or "").startswith("radar_tab_")]
+    assert len(radar_tabs) == 6, f"radar should have 6 sub-nav tabs, got {len(radar_tabs)}"
+    print("       radar sub-nav tabs:", [b.label for b in radar_tabs])
 
 # 7. 新项目评审（含 ② 行业认知嵌入区块）
 # 7a. 未填 key：必须出现「功能不可用」警告，且不渲染评审 selectbox

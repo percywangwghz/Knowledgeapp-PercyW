@@ -408,16 +408,61 @@ def _write_back_industry(doc, project_title, coord, var_updates,
                       "关键变量表": ok_var, "评审留档": ok_arc}
 
 
-# ==================== 主视图 ====================
+# ==================== 主视图（demo §10：五步进度条 → 选择 → 生成 → 两栏审阅 → diff 提交） ====================
+
+_STEP_FLOW = ["01 选项目", "02 选行业", "03 生成", "04 审阅", "05 入库"]
+
+
+def _steps_html(cur):
+    """demo .steps-flow：之前步实心 done，当前步 accent 描点。"""
+    parts = []
+    for i, name in enumerate(_STEP_FLOW, 1):
+        cls = "step-node" + (" done" if i < cur else "") + (" current" if i == cur else "")
+        parts.append(f"<div class='{cls}'><span class='dot'></span>"
+                     f"<span class='sn'>{name}</span></div>")
+        if i < len(_STEP_FLOW):
+            parts.append("<div class='step-line'></div>")
+    return "<div class='steps-flow'>" + "".join(parts) + "</div>"
+
+
+def _grab_section(content, kw, n=400):
+    """行业总文档里标题含 kw 的章节正文（压平空白、截断），找不到返回 ""。"""
+    m = re.search(r"^#{2,4}[^\n]*" + kw + r"[^\n]*\n(.*?)(?=^#{2,4} |\Z)",
+                  content, re.DOTALL | re.MULTILINE)
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", m.group(1)).strip()[:n]
+
+
+def _industry_snapshot(content):
+    """从行业总文档解析 EXISTING KNOWLEDGE 三件套：行业阶段 / 当前坐标 / 当前核心变量。
+    文档结构无强约束，这里是尽力解析，找不到显示「—」。"""
+    out = {"stage": "", "coord": "", "variables": []}
+    if not content:
+        return out
+    out["stage"] = _grab_section(content, "行业阶段") or _grab_section(content, "阶段判断")
+    out["coord"] = _grab_section(content, "行业坐标")
+    m = re.search(r"^#{2,4}[^\n]*(?:核心变量|关键变量)[^\n]*\n(.*?)(?=^#{2,4} |\Z)",
+                  content, re.DOTALL | re.MULTILINE)
+    if m:
+        cells = []
+        for line in m.group(1).split("\n"):
+            line = line.strip()
+            if not line.startswith("|") or re.match(r"^\|[\s\-|]+\|$", line):
+                continue
+            first = line.strip("|").split("|")[0].strip().replace("**", "")
+            if first and first not in ("变量", "关键变量", "核心变量", "名称"):
+                cells.append(first)
+        out["variables"] = cells[1:6] if len(cells) > 1 else cells[:5]  # 首行多为表头
+    return out
+
 
 def render_review(index, on_saved):
-    st.markdown("<div class='doc-title'>🧭 新项目评审</div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='meta-line'>以行业总文档为认知底座评审新项目：AI 生成评审草稿，"
-        "确认后同时写回项目文档与行业总文档（落位表 / 关键变量 / 评审留档）。</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("<div style='margin-bottom:1rem'></div>", unsafe_allow_html=True)
+    # 与 reader/battle/radar 一致：撑开主区，消除两侧留白
+    st.markdown('<div class="page-wide-marker"></div>', unsafe_allow_html=True)
+    st.markdown("<div class='section-label'>新项目评审</div>"
+                "<div class='page-title' style='font-size:24px'>行业对照与差距评估</div>",
+                unsafe_allow_html=True)
 
     has_key = bool(get_api_key())
     if not has_key:
@@ -428,17 +473,22 @@ def render_review(index, on_saved):
     if not deals:
         st.info("02_deals 暂无文档。")
         return
-
-    # ---- ① 新项目评审 ----
-    st.markdown("<div class='section-header'>① 新项目评审</div>", unsafe_allow_html=True)
     if not has_key:
         st.info("填入 API Key 后可使用 AI 评审草稿与写回功能。")
         return
-
     industries = [d for d in index.get("documents", []) if d.get("category_key") == "01_industry"]
     if not industries:
         st.info("01_industry 暂无行业总文档。")
         return
+
+    # ---- 五步进度条：有草稿→04 REVIEW；刚提交→05 COMMIT；否则 01 PROJECT ----
+    if st.session_state.pop("_review_just_committed", None):
+        cur_step = 5
+    elif st.session_state.get("review_draft"):
+        cur_step = 4
+    else:
+        cur_step = 1
+    st.markdown(_steps_html(cur_step), unsafe_allow_html=True)
 
     proj_options = {f"[{d.get('track', '未分类')}] {_doc_title(d)}": d for d in deals}
     preselect = st.session_state.pop("review_preselect_path", None)
@@ -450,20 +500,29 @@ def render_review(index, on_saved):
                 break
     ind_options = {_doc_title(d): d for d in industries}
 
+    # ---- 01 Project / 02 Industry Context（demo .review-field） ----
     col_p, col_i = st.columns(2)
     with col_p:
-        kw_p = st.text_input("🔍 搜索项目", key="review_kw_p",
-                             placeholder="输入关键词过滤（项目名/赛道/定位）…")
+        st.markdown("<div class='review-field'><div class='fl'>"
+                    "01 项目 —— 搜索或选择项目（02_deals）</div></div>",
+                    unsafe_allow_html=True)
+        kw_p = st.text_input("搜索项目", key="review_kw_p",
+                             placeholder="输入关键词过滤（项目名/赛道/定位）…",
+                             label_visibility="collapsed")
         popts = _filter_options(proj_options, kw_p)
         if not popts:
             st.info("无匹配项目，换个关键词试试。")
             return
         chosen_p = st.selectbox("选择评审项目（02_deals）", list(popts.keys()),
-                                key="review_project")
+                                key="review_project", label_visibility="collapsed")
     pdoc = proj_options[chosen_p]
     with col_i:
-        kw_i = st.text_input("🔍 搜索行业总文档", key="review_kw_i",
-                             placeholder="输入关键词过滤行业…")
+        st.markdown("<div class='review-field'><div class='fl'>"
+                    "02 行业背景 —— 选择行业总文档（01_industry）</div></div>",
+                    unsafe_allow_html=True)
+        kw_i = st.text_input("搜索行业总文档", key="review_kw_i",
+                             placeholder="输入关键词过滤行业…",
+                             label_visibility="collapsed")
         iopts = _filter_options(ind_options, kw_i)
         if not iopts:
             st.info("无匹配行业总文档，换个关键词试试。")
@@ -472,7 +531,8 @@ def render_review(index, on_saved):
         default_label = _doc_title(industries[_default_industry_idx(pdoc, industries)])
         default_i = list(iopts.keys()).index(default_label) if default_label in iopts else 0
         chosen_i = st.selectbox("选择行业总文档（01_industry）", list(iopts.keys()),
-                                index=default_i, key="review_industry")
+                                index=default_i, key="review_industry",
+                                label_visibility="collapsed")
     indoc = ind_options[chosen_i]
 
     # ---- 后台评审任务：恢复 / 状态显示 ----
@@ -496,12 +556,15 @@ def render_review(index, on_saved):
         # （生成中切换项目/行业选择是常态，一切就丢草稿等于白跑；下次启动新任务会覆盖）
         job = None
 
-    # ---- 生成草稿（后台线程，不阻塞 rerun）----
+    # ---- 03 ANALYSIS：生成草稿（后台线程，不阻塞 rerun）----
     running = _thread_alive()
-    if st.button("🔮 AI 生成评审草稿", type="primary", disabled=running,
+    if st.button("生成评审草稿", type="primary", disabled=running,
                  help="后台生成，可随时切换页面；完成后回到本页自动出现草稿"):
         _start_job(pdoc, indoc)
         st.rerun()
+    if running:
+        st.markdown("<div class='progress-note'>正在生成评审草稿… "
+                    "后台进行中，可自由切换页面。</div>", unsafe_allow_html=True)
 
     _render_job_live(key)  # 固定挂载，内部按状态决定是否渲染
     if job and job.get("status") == "running":
@@ -533,7 +596,7 @@ def render_review(index, on_saved):
         st.session_state.selected_doc = None
         st.rerun()
 
-    # ---- 草稿展示与确认写回 ----
+    # ---- 04 REVIEW：两栏（EXISTING KNOWLEDGE / AI ASSESSMENT）+ 05 COMMIT diff 预览 ----
     draft = st.session_state.get("review_draft")
     if not draft or draft.get("project_path") != pdoc["path"] \
             or draft.get("industry_path") != indoc["path"]:
@@ -544,43 +607,115 @@ def render_review(index, on_saved):
     feedback = data.get("feedback_thesis", "")
     stage_update = data.get("industry_stage_update", "")
 
-    st.divider()
-    st.markdown("**评审草稿**（两段长文本可编辑，确认后写入两个文档）")
-    st.text_area("项目判断（写入项目文档）", key="review_pj", height=220)
+    snap = _industry_snapshot(indoc.get("content", ""))
+    vars_html = ("".join(f"<li>{html.escape(v)}</li>" for v in snap["variables"])
+                 if snap["variables"] else "<p>—</p>")
+    if snap["variables"]:
+        vars_html = f"<ul>{vars_html}</ul>"
 
-    st.markdown(f"**坐标落位**：维度A `{coord.get('dim_a', '—')}` ｜ "
-                f"维度B `{coord.get('dim_b', '—')}` ｜ {coord.get('reason', '—')}")
+    col_l, col_r = st.columns(2, gap="large")
+    with col_l:
+        st.markdown("<div class='section-label' style='margin-top:1.2rem'>"
+                    "现有知识</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='assess-block'><h4>行业阶段</h4>"
+            f"<p>{html.escape(snap['stage'] or '—')}</p></div>"
+            "<div class='assess-block'><h4>当前坐标</h4>"
+            f"<p>{html.escape(snap['coord'] or '—')}</p></div>"
+            f"<div class='assess-block'><h4>当前核心变量</h4>{vars_html}</div>",
+            unsafe_allow_html=True)
+    with col_r:
+        st.markdown("<div class='section-label' style='margin-top:1.2rem'>"
+                    "AI 评估</div>", unsafe_allow_html=True)
+        st.markdown("<div class='assess-block'><h4>项目判断（可编辑，写入项目文档）</h4></div>",
+                    unsafe_allow_html=True)
+        st.text_area("项目判断", key="review_pj", height=180,
+                     label_visibility="collapsed")
+        st.markdown(
+            "<div class='assess-block'><h4>坐标落位</h4>"
+            f"<p>维度A <b>{html.escape(str(coord.get('dim_a', '—')))}</b> ｜ "
+            f"维度B <b>{html.escape(str(coord.get('dim_b', '—')))}</b> ｜ "
+            f"{html.escape(str(coord.get('reason', '—')))}</p></div>",
+            unsafe_allow_html=True)
+        if var_updates:
+            lines = ["| 关键变量 | 旧判断 | 新判断 | 触发来源 |", "|---|---|---|---|"]
+            for v in var_updates:
+                lines.append(f"| {_cell(v.get('variable'))} | {_cell(v.get('old'))} "
+                             f"| {_cell(v.get('new'))} | {_cell(v.get('source'))} |")
+            st.markdown("<div class='assess-block'><h4>关键变量更新</h4></div>",
+                        unsafe_allow_html=True)
+            st.markdown("\n".join(lines))
+        else:
+            st.markdown("<div class='assess-block'><h4>关键变量更新</h4>"
+                        "<p>无更新</p></div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='assess-block'><h4>反哺判断</h4>"
+            f"<p>{html.escape(feedback or '—')}</p></div>"
+            "<div class='assess-block'><h4>行业阶段更新</h4>"
+            f"<p>{html.escape(stage_update or '维持不变')}</p></div>",
+            unsafe_allow_html=True)
+        st.markdown("<div class='assess-block'><h4>增量思考"
+                    "（可编辑，写入行业总文档 · N.3 评审留档）</h4></div>",
+                    unsafe_allow_html=True)
+        st.text_area("增量思考", key="review_ida", height=180,
+                     label_visibility="collapsed")
+
+    # ---- Commit Preview（demo .diff-block）----
+    has_section = bool(REVIEW_SECTION_RE.search(pdoc.get("content", "")))
+    p_sign, p_cls = ("~", "mod") if has_section else ("+", "add")
+    rows = [
+        (p_cls, p_sign,
+         ("替换" if has_section else "新增") + "：「## 🧭 行业总文档评审」节"
+         "（项目判断 + 坐标落位 + 反哺判断）", _doc_title(pdoc)),
+        ("add", "+", "新增：行业坐标落位表 1 行", _doc_title(indoc)),
+    ]
     if var_updates:
-        lines = ["| 关键变量 | 旧判断 | 新判断 | 触发来源 |", "|---|---|---|---|"]
-        for v in var_updates:
-            lines.append(f"| {_cell(v.get('variable'))} | {_cell(v.get('old'))} "
-                         f"| {_cell(v.get('new'))} | {_cell(v.get('source'))} |")
-        st.markdown("\n".join(lines))
-    else:
-        st.caption("关键变量演进：无更新")
-    st.markdown(f"**行业阶段更新**：{stage_update or '维持不变'}")
-    st.markdown(f"**反哺判断**：{feedback or '—'}")
+        rows.append(("add", "+", f"新增：关键变量演进 {len(var_updates)} 行",
+                     _doc_title(indoc)))
+    rows += [
+        ("add", "+", "新增：N.3 评审留档条目（增量思考 + 反哺判断 + 阶段更新）",
+         _doc_title(indoc)),
+        ("mod", "~", "更新：头部更新日期", _doc_title(indoc)),
+    ]
+    st.markdown(
+        "<div class='home-section'><div class='section-label'>"
+        "写回预览 —— 差异对比</div><div class='diff-block'>"
+        + "".join(f"<div class='diff-row {cls}'><span class='sign'>{sign}</span>"
+                  f"<span>{html.escape(text)}</span>"
+                  f"<span class='dt'>{html.escape(dt)}</span></div>"
+                  for cls, sign, text, dt in rows)
+        + "</div></div>",
+        unsafe_allow_html=True)
 
-    st.text_area("增量思考（写入行业总文档 · N.3 评审留档）", key="review_ida", height=220)
-
-    if st.button("💾 确认写入两个文档", type="primary"):
-        judgment = st.session_state.get("review_pj", data.get("project_judgment", ""))
-        additions = st.session_state.get("review_ida", data.get("industry_doc_additions", ""))
-        try:
-            p_path = _write_back_project(pdoc, _doc_title(indoc), judgment, coord, feedback)
-            i_path, report = _write_back_industry(indoc, _doc_title(pdoc), coord,
-                                                  var_updates, additions, feedback,
-                                                  stage_update)
-        except Exception as e:
-            st.error(f"写入失败：{e}")
-            return
-        st.session_state.pop("review_draft", None)
-        on_saved()
-        st.session_state.review_next_battle_path = pdoc["path"]  # 串联：写回后提供「发起 Battle」跳转
-        miss = [k for k, v in report.items() if not v]
-        note = f"（未定位到：{'、'.join(miss)}）" if miss else ""
-        st.session_state.review_flash = (
-            f"已写入 `{os.path.basename(p_path)}` 的「🧭 行业总文档评审」与 "
-            f"`{os.path.basename(i_path)}` 的落位表/关键变量/评审留档{note}。"
-        )
-        st.rerun()
+    c_back, c_commit, _pad = st.columns([1.2, 1.6, 5])
+    with c_back:
+        if st.button("返回", key="review_back", use_container_width=True,
+                     help="丢弃草稿，返回重新选择/生成"):
+            st.session_state.pop("review_draft", None)
+            st.rerun()
+    with c_commit:
+        if st.button("提交入库", type="primary", key="review_commit",
+                     use_container_width=True):
+            judgment = st.session_state.get("review_pj", data.get("project_judgment", ""))
+            additions = st.session_state.get("review_ida",
+                                             data.get("industry_doc_additions", ""))
+            try:
+                p_path = _write_back_project(pdoc, _doc_title(indoc), judgment, coord,
+                                             feedback)
+                i_path, report = _write_back_industry(indoc, _doc_title(pdoc), coord,
+                                                      var_updates, additions, feedback,
+                                                      stage_update)
+            except Exception as e:
+                st.error(f"写入失败：{e}")
+                return
+            st.session_state.pop("review_draft", None)
+            on_saved()
+            st.session_state.review_next_battle_path = pdoc["path"]  # 串联：写回后提供「发起 Battle」跳转
+            st.session_state._review_just_committed = True  # 进度条点亮 05 COMMIT
+            miss = [k for k, v in report.items() if not v]
+            note = f"（未定位到：{'、'.join(miss)}）" if miss else ""
+            st.session_state.review_flash = (
+                f"已写入 `{os.path.basename(p_path)}` 的「🧭 行业总文档评审」与 "
+                f"`{os.path.basename(i_path)}` 的落位表/关键变量/评审留档{note}。"
+            )
+            st.rerun()

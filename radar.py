@@ -19,6 +19,7 @@ import os
 import threading
 import time
 from datetime import date, datetime, timedelta
+from urllib.parse import quote as _urlquote
 
 import streamlit as st
 
@@ -35,6 +36,12 @@ THEMES = radar_auto.THEMES
 SOURCE_TYPES = ["产业信息", "资本信息", "投资人观点"]
 EVENT_TYPES = ["Technology", "Market", "Capital", "Competitive", "Policy"]
 VAR_TYPES = ["Technology", "Demand", "Capital", "Competitive", "Regulatory"]
+
+# 数据词典（AI 写入 JSON 的枚举值，勿改动）→ UI 显示中文
+_EVENT_TYPE_CN = {"Technology": "技术", "Market": "市场", "Capital": "资本",
+                  "Competitive": "竞争", "Policy": "政策"}
+_VAR_TYPE_CN = {"Technology": "技术", "Demand": "需求", "Capital": "资本",
+                "Competitive": "竞争", "Regulatory": "监管"}
 
 REPORT_CATEGORY = "05_tracking"
 
@@ -478,290 +485,434 @@ def _write_report(report_md, end):
     return abs_path
 
 
-# ==================== 页面 ====================
+# ==================== 页面（demo §11：radar-nav 子导航 + 六个子页） ====================
 
-def render_radar(index, on_saved):
-    st.markdown("<div class='doc-title'>📡 Investment Radar</div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='meta-line'>市场认知追踪层：信号由 AI 自动抓取，叙事与边际变量自动维护。"
-        "区分 事实 → 市场解释 → 认知变化；产出供 Thesis Battle 使用。</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("<div style='margin-bottom:0.8rem'></div>", unsafe_allow_html=True)
+_RADAR_TABS = [("overview", "总览"), ("signals", "信号"), ("themes", "主题"),
+               ("variables", "变量"), ("reports", "报告"), ("sources", "来源")]
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📥 信息采集", "🧭 主题叙事", "⚡ 边际变量",
-                                            "📰 周报生成", "📱 公众号"])
 
-    # ---------- Tab 1: 信息采集（信号看板） ----------
-    with tab1:
-        running = _job_running()
-        c_f, c_p, c_t = st.columns([2, 2, 4])
-        with c_f:
-            btn_full = st.button("🔄 立即抓取（全量）", disabled=running,
-                                 help="抓取 watchlist 全部启用主题，并更新认知库（后台执行）")
-        with c_p:
-            btn_primary = st.button("⚡ 重点主题短跑", disabled=running,
-                                    help="只跑 primary 主题（周中使用，后台执行）")
-        with c_t:
-            last = radar_auto.last_run_time()
-            st.markdown(f"<div class='caption' style='margin-top:0.6rem'>上次自动抓取：{last or '从未'}</div>",
-                        unsafe_allow_html=True)
-        if (btn_full or btn_primary) and not running:
-            _start_job(primary_only=btn_primary)
-            st.rerun()
+def _sig_row_html(s):
+    """demo .signal-row：日期 / 主题 / 类型 / 内容 / Why it matters（行式，不是卡片）。"""
+    d = str(s.get("date", "—"))[5:10]
+    what = html.escape(str(s.get("title") or "（无标题）"))
+    if s.get("summary"):
+        what += (f" <span style='color:var(--text-tertiary)'>"
+                 f"{html.escape(str(s['summary'])[:90])}</span>")
+    why = html.escape(str(s.get("why") or s.get("importance_reason") or "")[:120])
+    return (f"<div class='signal-row'><span class='d'>{d}</span>"
+            f"<span class='theme'>{html.escape(str(s.get('theme', '—')))}</span>"
+            f"<span class='type'>{html.escape(_EVENT_TYPE_CN.get(str(s.get('event_type')), str(s.get('event_type', '—'))))}</span>"
+            f"<span class='what'>{what}</span>"
+            f"<span class='why'>{why}</span></div>")
 
-        job = _read_job()
-        _render_job_live()  # 固定挂载，内部按状态决定是否渲染
-        if running:
-            pass
-        elif job and job.get("status") == "running":
-            # 任务文件仍是 running 但线程已不在：应用曾被重启/进程被杀，任务中断
-            st.warning("上次自动任务被中断（应用重启或进程退出），结果可能不完整，可重新发起。")
-            _render_job_steps(job.get("steps", []))
-        elif job and job.get("status") in ("done", "error"):
-            _render_job_result(job)
 
-        signals = _load("radar_signals.json", [])
-        if not signals:
-            st.info("信号池为空，点击上方按钮开始首次自动抓取。")
-        else:
-            week_ago = (date.today() - timedelta(days=7)).isoformat()
-            n_week = sum(1 for s in signals if str(s.get("date", ""))[:10] >= week_ago)
-            m1, m2, m3 = st.columns(3)
-            m1.metric("信号总数", len(signals))
-            m2.metric("近 7 天新增", n_week)
-            m3.metric("覆盖主题", len({s.get("theme") for s in signals}))
-            dist = {}
-            for s in signals:
-                dist[s.get("theme", "其他")] = dist.get(s.get("theme", "其他"), 0) + 1
-            st.markdown(
-                "<div class='caption'>主题分布：" +
-                " · ".join(f"{t} {n}" for t, n in sorted(dist.items(), key=lambda x: -x[1])) +
+def _evidence_html(text):
+    """主题字段（可能多行）→ theme-sec 内容：多行渲染为 <ul>，单行 <p>。"""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    lines = [l.strip().lstrip("-·• ") for l in text.split("\n") if l.strip()]
+    if len(lines) > 1:
+        return "<ul>" + "".join(f"<li>{html.escape(l)}</li>" for l in lines) + "</ul>"
+    return f"<p>{html.escape(text)}</p>"
+
+
+# ---------- Overview ----------
+
+def _render_overview():
+    # 抓取操作（quiet 按钮）+ 上次抓取时间
+    running = _job_running()
+    c_f, c_p, c_t = st.columns([1.6, 1.6, 6])
+    with c_f:
+        btn_full = st.button("全量抓取", disabled=running,
+                             help="抓取 watchlist 全部启用主题，并更新认知库（后台执行）")
+    with c_p:
+        btn_primary = st.button("重点主题短跑", disabled=running,
+                                help="只跑 primary 主题（周中使用，后台执行）")
+    with c_t:
+        last = radar_auto.last_run_time()
+        st.markdown(f"<div class='caption' style='margin-top:0.6rem'>上次自动抓取：{last or '从未'}</div>",
+                    unsafe_allow_html=True)
+    if (btn_full or btn_primary) and not running:
+        _start_job(primary_only=btn_primary)
+        st.rerun()
+
+    job = _read_job()
+    _render_job_live()  # 固定挂载，内部按状态决定是否渲染
+    if running:
+        pass
+    elif job and job.get("status") == "running":
+        # 任务文件仍是 running 但线程已不在：应用曾被重启/进程被杀，任务中断
+        st.warning("上次自动任务被中断（应用重启或进程退出），结果可能不完整，可重新发起。")
+        _render_job_steps(job.get("steps", []))
+    elif job and job.get("status") in ("done", "error"):
+        _render_job_result(job)
+
+    signals = _load("radar_signals.json", [])
+    variables = _load("radar_variables.json", [])
+    themes = _load("radar_themes.json", {})
+    week_ago = (date.today() - timedelta(days=7)).isoformat()
+
+    # ---- TODAY：三个 mono 大数字（近 7 天） ----
+    n_sig = sum(1 for s in signals if str(s.get("date", ""))[:10] >= week_ago)
+    n_theme = sum(1 for d in themes.values()
+                  if str(d.get("updated", ""))[:10] >= week_ago
+                  or any(str(h.get("date", ""))[:10] >= week_ago
+                         for h in d.get("history", [])))
+    n_var = sum(1 for v in variables if str(v.get("date", ""))[:10] >= week_ago)
+    st.markdown("<div class='section-label' style='margin-top:1.6rem'>今日 · 近 7 天</div>"
+                "<div class='today-strip'>"
+                f"<div class='today-num'><div class='n'>{n_sig:02d}</div>"
+                "<div class='l'>新增信号</div></div>"
+                f"<div class='today-num'><div class='n'>{n_theme:02d}</div>"
+                "<div class='l'>主题变化</div></div>"
+                f"<div class='today-num'><div class='n'>{n_var:02d}</div>"
+                "<div class='l'>变量更新</div></div>"
                 "</div>", unsafe_allow_html=True)
 
-            st.markdown("<div class='section-header'>信号池（🤖 = 自动抓取）</div>", unsafe_allow_html=True)
-            filter_theme = st.selectbox("按主题筛选", ["全部"] + THEMES, key="sig_filter")
-            shown = 0
-            for real_idx in range(len(signals) - 1, -1, -1):
-                s = signals[real_idx]
-                if filter_theme != "全部" and s.get("theme") != filter_theme:
-                    continue
-                if shown >= 30:
-                    break
-                shown += 1
-                col_a, col_b = st.columns([12, 1])
-                with col_a:
-                    auto_mark = "🤖 " if s.get("auto") else ("📱 " if s.get("origin") == "wechat" else "")
-                    track = f" · {s['sub_track']}" if s.get("sub_track") else ""
-                    imp = f" · ⚑{s['importance']}" if s.get("importance") else ""
-                    html = (
-                        f"<div class='meta-line'>[{s.get('date', '—')}] {s.get('source_type', '—')} · "
-                        f"{s.get('theme', '—')} · {s.get('event_type', '—')}{track}{imp}</div>"
-                        f"<div style='font-weight:600'>{auto_mark}{s.get('title', '（无标题）')}</div>")
-                    if s.get("summary"):
-                        html += f"<div class='caption'>{s['summary'][:150]}</div>"
-                    if s.get("why"):
-                        html += f"<div class='caption'>💡 {s['why'][:120]}</div>"
-                    if s.get("importance_reason"):
-                        html += f"<div class='caption'>⚑ {s['importance_reason'][:120]}</div>"
-                    if s.get("companies"):
-                        html += f"<div class='caption'>🏢 {s['companies']}</div>"
-                    if s.get("targets"):
-                        html += f"<div class='caption'>🎯 {s['targets']}</div>"
-                    st.markdown(html, unsafe_allow_html=True)
-                with col_b:
-                    if st.button("🗑️", key=f"del_sig_{real_idx}", help="删除该条"):
-                        signals.pop(real_idx)
-                        _save("radar_signals.json", signals)
-                        st.rerun()
-
-    # ---------- Tab 2: 主题叙事（行业认知库） ----------
-    with tab2:
-        themes = _load("radar_themes.json", {})
-        c_sel, c_btn = st.columns([4, 1])
-        with c_sel:
-            theme = st.selectbox("选择主题", THEMES, key="radar_theme")
-        with c_btn:
-            st.markdown("<div style='margin-top:1.6rem'></div>", unsafe_allow_html=True)
-            refresh = st.button("🔄 更新认知", help="基于该主题近 7 天信号重新生成叙事与边际变量")
-        if refresh:
-            if not llm.get_api_key():
-                st.warning("未填入 API Key，无法更新认知："
-                           "请先在左侧边栏「API 设置」处填入你自己的 key（sk-...）。")
-            else:
-                with st.spinner(f"正在更新「{theme}」认知…"):
-                    res = radar_auto.update_cognition(theme)
-                if res.get("updated") or res.get("variables"):
-                    st.toast(f"已更新：叙事 {'✓' if res.get('updated') else '不变'}，"
-                             f"新增边际变量 {res.get('variables', 0)} 个")
-                    st.rerun()
-                else:
-                    st.info(f"「{theme}」近 7 天信号不足，暂无更新（先跑一次自动抓取）。")
-
-        entry = themes.get(theme, {"current": {}, "history": []})
-        cur = entry.get("current", {})
-        if cur.get("narrative"):
-            st.markdown(
-                f"<div class='card'><div class='meta-line'>当前叙事（更新于 {entry.get('updated', '—')}）</div>"
-                f"<div style='font-weight:600; margin-top:0.2rem'>{cur['narrative']}</div></div>",
-                unsafe_allow_html=True,
-            )
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"<div class='card'><div class='meta-line'>支持证据</div>"
-                            f"<div>{cur.get('evidence', '—')}</div></div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='card'><div class='meta-line'>市场共识</div>"
-                            f"<div>{cur.get('consensus', '—')}</div></div>", unsafe_allow_html=True)
-            with c2:
-                st.markdown(f"<div class='card'><div class='meta-line'>代表性观点</div>"
-                            f"<div>{cur.get('views', '—')}</div></div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='card'><div class='meta-line'>核心分歧</div>"
-                            f"<div>{cur.get('divergence', '—')}</div></div>", unsafe_allow_html=True)
-        else:
-            st.info("该主题还没有认知记录——跑一次自动抓取，或点上方「更新认知」基于现有信号生成。")
-
-        history = entry.get("history", [])
-        if history:
-            st.markdown("<div class='section-header'>叙事演变历史</div>", unsafe_allow_html=True)
-            for h in reversed(history[-8:]):
-                flag = "🔀 转变" if h.get("is_transition") else "更新"
-                with st.expander(f"[{h.get('date', '—')}] {flag}"):
-                    st.markdown(f"**过去**：{h.get('previous', '—')}")
-                    st.markdown(f"**之后**：{h.get('new', '—')}")
-                    if h.get("trigger"):
-                        st.markdown(f"**触发**：{h['trigger']}")
-                    if h.get("meaning"):
-                        st.markdown(f"**含义**：{h['meaning']}")
-
-    # ---------- Tab 3: 边际变量（自动提炼） ----------
-    with tab3:
-        st.markdown("<div class='section-header'>边际变量库（AI 从信号中自动提炼，🤖 标记）</div>",
+    # ---- SIGNAL STREAM：最新 8 条行式列表 ----
+    st.markdown("<div class='section-label'>信号流</div>", unsafe_allow_html=True)
+    if signals:
+        st.markdown("".join(_sig_row_html(s) for s in signals[-8:][::-1]),
                     unsafe_allow_html=True)
-        variables = _load("radar_variables.json", [])
-        if not variables:
-            st.info("尚无边际变量——自动抓取后由 AI 从信号中提炼，或到「主题叙事」手动触发更新。")
-        for v in variables[-15:][::-1]:
-            auto_mark = "🤖 " if v.get("auto") else ""
-            with st.expander(f"[{v.get('date', '—')}] {auto_mark}{v.get('title', '（无标题）')}"
-                             f"（{v.get('var_type', '—')} / {v.get('theme', '—')}）"):
-                st.markdown(f"**边际变量**：{v.get('marginal_var', '—')}")
-                st.markdown(f"**新增信息**：{v.get('new_info', '—')}")
-                st.markdown(f"**预期变化**：{v.get('prev_expect', '—')} → {v.get('expect_change', '—')}")
-                st.markdown(f"**市场影响**：{v.get('market_impact', '—')}")
-                if v.get("targets"):
-                    st.markdown(f"**🎯 关联标的（AI 推导，需人工核实）**：{v['targets']}")
-
-    # ---------- Tab 4: 周报生成 ----------
-    with tab4:
-        st.markdown("<div class='section-header'>生成 Weekly Market Intelligence Report</div>",
+    else:
+        st.markdown("<div class='meta-line' style='padding:0.6rem 0.2rem'>"
+                    "信号池为空，点上方「全量抓取」开始首次自动抓取。</div>",
                     unsafe_allow_html=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            start = st.date_input("起始日期", value=date.today() - timedelta(days=7), key="rep_start")
-        with c2:
-            end = st.date_input("截止日期", value=date.today(), key="rep_end")
-        key_questions = st.text_area(
-            "Key Questions to Monitor（未来关注变量，每行一条）", height=90,
-            placeholder="云厂商下一代集群架构是否明确采用CPO\n模型层价格战是否传导至应用层定价")
-        if st.button("📝 生成周报", type="primary"):
-            st.session_state["radar_report"] = build_weekly_report(start, end, key_questions)
 
-        report = st.session_state.get("radar_report")
-        if report:
-            with st.expander("📋 预览周报", expanded=True):
-                st.markdown(report)
-            if st.button("💾 写入知识库（05_tracking）"):
-                try:
-                    path = _write_report(report, end)
-                except OSError as e:
-                    st.error(f"写入失败：{e}。请检查知识库目录存在且可写。")
-                else:
-                    on_saved()
-                    st.success(f"已写入：{os.path.basename(path)}")
-                    st.rerun()
-
-    # ---------- Tab 5: 公众号文章 → 技术提取 ----------
-    with tab5:
-        st.markdown("<div class='section-header'>公众号文章 → 技术提取（沉淀到 09_tech 技术档案）</div>",
+    # ---- NARRATIVE CHANGES：近 30 天的叙事历史条目 ----
+    month_ago = (date.today() - timedelta(days=30)).isoformat()
+    changes = []
+    for t, d in themes.items():
+        for h in d.get("history", []):
+            if str(h.get("date", ""))[:10] >= month_ago:
+                changes.append((str(h.get("date", "")), t, h))
+    changes.sort(key=lambda x: x[0], reverse=True)
+    if changes:
+        blocks = []
+        for _d, t, h in changes[:4]:
+            text = f"「{h.get('previous', '—')}」→「{h.get('new', '—')}」"
+            if h.get("trigger"):
+                text += f"。触发：{h['trigger']}"
+            # demo：转变用 accent 左边线，微调用 warning 色
+            warn = " style='border-left-color:var(--warning)'" \
+                if not h.get("is_transition") else ""
+            blocks.append(f"<div class='narrative-block'{warn}>"
+                          f"<div class='nt'>{html.escape(str(t))}</div>"
+                          f"<p>{html.escape(text[:220])}</p></div>")
+        st.markdown("<div class='home-section'><div class='section-label'>"
+                    "叙事变化</div>" + "".join(blocks) + "</div>",
                     unsafe_allow_html=True)
-        urls_text = st.text_area(
-            "文章链接（每行一个，mp.weixin.qq.com；被反爬拦截时改用下方粘贴正文）",
-            height=100, key="wc_urls", placeholder="https://mp.weixin.qq.com/s/...")
-        with st.expander("或直接粘贴正文（单篇）"):
-            raw_title = st.text_input("标题", key="wc_raw_title")
-            raw_account = st.text_input("公众号名", key="wc_raw_account")
-            raw_content = st.text_area("正文", height=150, key="wc_raw_content")
-        tech_running = _tech_job_running()
-        if st.button("🧪 技术提取", type="primary", key="wc_analyze", disabled=tech_running):
-            articles = []
-            urls = [u.strip() for u in urls_text.split("\n") if u.strip()]
-            if urls:
-                with st.spinner(f"抓取 {len(urls)} 篇文章…"):
-                    for u in urls:
-                        articles.append(radar_wechat.fetch_article(u))
-            if raw_content.strip():
-                articles.append({"url": "", "title": raw_title.strip(),
-                                 "account": raw_account.strip(), "date": "",
-                                 "text": raw_content.strip()})
-            ok = [a for a in articles if a.get("text")]
-            for a in articles:
-                if not a.get("text"):
-                    st.warning(f"抓取失败：{a.get('url', '粘贴正文')}（{a.get('error', '无正文')}）")
-            if ok:
-                _start_tech_job(_run_tech_extract, (ok,))  # 后台提取，进度落盘 tech_job.json
+
+    # ---- MARGINAL VARIABLES：最新 8 个 chips ----
+    if variables:
+        chips = "".join(
+            f"<span class='var-chip'>"
+            f"{html.escape(str(v.get('marginal_var') or v.get('title', '—'))[:30])}</span>"
+            for v in variables[-8:][::-1])
+        st.markdown("<div class='home-section'><div class='section-label'>"
+                    f"边际变量</div><div class='var-chips'>{chips}</div></div>",
+                    unsafe_allow_html=True)
+
+
+# ---------- Signals：信号池完整列表（筛选 + 删除） ----------
+
+def _render_signals():
+    st.markdown("<div class='section-label'>全部信号 · 信号池（🤖 自动抓取 / 📱 公众号）</div>",
+                unsafe_allow_html=True)
+    signals = _load("radar_signals.json", [])
+    if not signals:
+        st.markdown("<div class='empty-state'><div class='e-title'>信号池为空</div>"
+                    "<div class='e-sub'>到「总览」页跑一次「全量抓取」，AI 会自动填充这里。"
+                    "</div></div>", unsafe_allow_html=True)
+        return
+    filter_theme = st.selectbox("按主题筛选", ["全部"] + THEMES, key="sig_filter")
+    shown = 0
+    for real_idx in range(len(signals) - 1, -1, -1):
+        s = signals[real_idx]
+        if filter_theme != "全部" and s.get("theme") != filter_theme:
+            continue
+        if shown >= 50:
+            break
+        shown += 1
+        col_a, col_b = st.columns([23, 1])
+        with col_a:
+            st.markdown(_sig_row_html(s), unsafe_allow_html=True)
+        with col_b:
+            if st.button("×", key=f"del_sig_{real_idx}", help="删除该条", type="tertiary"):
+                signals.pop(real_idx)
+                _save("radar_signals.json", signals)
                 st.rerun()
 
-        tjob = _read_tech_job()
-        _render_tech_job_live()  # 固定挂载，内部按状态决定是否渲染
-        if tech_running:
-            pass
-        elif tjob and tjob.get("status") == "running":
-            # 任务文件仍是 running 但线程已不在：应用曾被重启/进程被杀，任务中断
-            st.warning("上次技术任务被中断（应用重启或进程退出），结果可能不完整，可重新发起。")
-        elif tjob and tjob.get("status") in ("done", "error"):
-            if tjob.get("phase") == "merge":
-                st.session_state["wc_tech_merged"] = tjob.get("merged") or {}
+
+# ---------- Themes：叙事长文（demo .theme-article） ----------
+
+def _render_themes():
+    themes = _load("radar_themes.json", {})
+    c_sel, c_btn = st.columns([4, 1])
+    with c_sel:
+        theme = st.selectbox("选择主题", THEMES, key="radar_theme",
+                             label_visibility="collapsed")
+    with c_btn:
+        refresh = st.button("更新认知", key="radar_refresh_cog",
+                            help="基于该主题近 7 天信号重新生成叙事与边际变量")
+    if refresh:
+        if not llm.get_api_key():
+            st.warning("未填入 API Key，无法更新认知："
+                       "请先在左侧边栏「API 设置」处填入你自己的 key（sk-...）。")
+        else:
+            with st.spinner(f"正在更新「{theme}」认知…"):
+                res = radar_auto.update_cognition(theme)
+            if res.get("updated") or res.get("variables"):
+                st.toast(f"已更新：叙事 {'✓' if res.get('updated') else '不变'}，"
+                         f"新增边际变量 {res.get('variables', 0)} 个")
+                st.rerun()
             else:
-                st.session_state["wc_tech"] = tjob.get("results", [])
-            _clear_tech_job()
+                st.info(f"「{theme}」近 7 天信号不足，暂无更新（先跑一次自动抓取）。")
+
+    entry = themes.get(theme, {"current": {}, "history": []})
+    cur = entry.get("current", {})
+    if not cur.get("narrative"):
+        st.info("该主题还没有认知记录——跑一次自动抓取，或点上方「更新认知」基于现有信号生成。")
+        return
+
+    history = entry.get("history", [])
+    parts = ["<div class='theme-article'>",
+             "<div class='section-label'>主题</div>",
+             f"<h2 class='tt'>{html.escape(str(theme))}</h2>",
+             f"<div class='t-sub'>最近叙事更新 "
+             f"{html.escape(str(entry.get('updated', '—')))} · "
+             f"历史 {len(history):02d} 条</div>"]
+
+    def sec(label, inner):
+        if inner:
+            parts.append(f"<div class='theme-sec'><div class='section-label'>{label}</div>"
+                         f"{inner}</div>")
+
+    sec("当前叙事",
+        f"<p>{html.escape(str(cur['narrative']))}</p>" if cur.get("narrative") else "")
+    sec("支撑证据", _evidence_html(cur.get("evidence")))
+    sec("代表性观点", _evidence_html(cur.get("views")))
+    sec("市场共识", _evidence_html(cur.get("consensus")))
+    sec("核心分歧", _evidence_html(cur.get("divergence")))
+
+    theme_vars = [v for v in _load("radar_variables.json", []) if v.get("theme") == theme]
+    if theme_vars:
+        chips = "".join(
+            f"<span class='var-chip'>"
+            f"{html.escape(str(v.get('marginal_var') or v.get('title', '—'))[:30])}</span>"
+            for v in theme_vars[-6:][::-1])
+        parts.append("<div class='theme-sec'><div class='section-label'>边际变量</div>"
+                     f"<div class='var-chips'>{chips}</div></div>")
+
+    if history:
+        rows = []
+        for h in reversed(history[-8:]):
+            hd = str(h.get("date", "—"))[:7].replace("-", ".")
+            hc = f"「{h.get('previous', '—')}」→「{h.get('new', '—')}」"
+            if h.get("trigger"):
+                hc += f"。触发：{h['trigger']}"
+            rows.append(f"<div class='history-row'><span class='hd'>{hd}</span>"
+                        f"<span class='hc'>{html.escape(hc[:180])}</span></div>")
+        parts.append("<div class='theme-sec'><div class='section-label'>叙事历史</div>"
+                     + "".join(rows) + "</div>")
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+# ---------- Variables：边际变量完整列表 ----------
+
+def _render_variables():
+    st.markdown("<div class='section-label'>跟踪变量 · AI 从信号中自动提炼</div>",
+                unsafe_allow_html=True)
+    variables = _load("radar_variables.json", [])
+    if not variables:
+        st.markdown("<div class='empty-state'><div class='e-title'>尚无边际变量</div>"
+                    "<div class='e-sub'>自动抓取后由 AI 从信号中提炼，"
+                    "或到 Themes 手动触发「更新认知」。</div></div>",
+                    unsafe_allow_html=True)
+        return
+    rows = []
+    for v in variables[::-1]:
+        date_s = str(v.get("date", ""))[:10]
+        mark = "🤖 " if v.get("auto") else ""
+        l2 = f"{_VAR_TYPE_CN.get(str(v.get('var_type')), v.get('var_type', '—'))} · {v.get('theme', '—')} · {v.get('marginal_var', '—')}"
+        l3 = (f"新增：{v.get('new_info', '—')} ｜ 预期：{v.get('prev_expect', '—')} → "
+              f"{v.get('expect_change', '—')} ｜ 影响：{v.get('market_impact', '—')}")
+        rows.append(
+            f"<div class='lib-row'><span class='l1'>"
+            f"<span class='title'>{mark}{html.escape(str(v.get('title') or '（无标题）'))}</span>"
+            f"<span class='date'>{date_s}</span></span>"
+            f"<span class='l2' style='font-family:var(--font-mono)'>{html.escape(l2)}</span>"
+            f"<span class='l3'>{html.escape(l3[:160])}</span></div>")
+    st.markdown("".join(rows), unsafe_allow_html=True)
+
+
+# ---------- Reports：历史周报 + 生成新周报 ----------
+
+def _render_reports(index, on_saved):
+    st.markdown("<div class='section-label'>雷达周报 · 每周市场情报</div>",
+                unsafe_allow_html=True)
+    reports = [d for d in index.get("documents", [])
+               if d.get("category_key") == "05_tracking" and "周报" in d.get("name", "")]
+    if reports:
+        rows = []
+        for d in sorted(reports, key=lambda x: str(x.get("modified", "")),
+                        reverse=True)[:10]:
+            title = d.get("title") or d["name"].replace(".md", "")
+            rows.append(
+                f"<a class='doc-row' href='?doc={_urlquote(d['path'])}' target='_self'>"
+                f"<span class='title'>{html.escape(title)}</span>"
+                f"<span class='meta'>{html.escape(str(d.get('track') or ''))}</span>"
+                f"<span class='date'>{str(d.get('modified', ''))[:10]}</span></a>")
+        st.markdown("".join(rows), unsafe_allow_html=True)
+
+    st.markdown("<div class='home-section'><div class='section-label'>生成新周报</div></div>",
+                unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        start = st.date_input("起始日期", value=date.today() - timedelta(days=7), key="rep_start")
+    with c2:
+        end = st.date_input("截止日期", value=date.today(), key="rep_end")
+    key_questions = st.text_area(
+        "Key Questions to Monitor（未来关注变量，每行一条）", height=90,
+        placeholder="云厂商下一代集群架构是否明确采用CPO\n模型层价格战是否传导至应用层定价")
+    if st.button("生成周报", type="primary"):
+        st.session_state["radar_report"] = build_weekly_report(start, end, key_questions)
+
+    report = st.session_state.get("radar_report")
+    if report:
+        with st.expander("📋 预览周报", expanded=True):
+            st.markdown(report)
+        if st.button("💾 写入知识库（05_tracking）"):
+            try:
+                path = _write_report(report, end)
+            except OSError as e:
+                st.error(f"写入失败：{e}。请检查知识库目录存在且可写。")
+            else:
+                on_saved()
+                st.success(f"已写入：{os.path.basename(path)}")
+                st.rerun()
+
+
+# ---------- Sources：公众号文章 → 技术提取 ----------
+
+def _render_sources(on_saved):
+    st.markdown("<div class='section-label'>来源 · 公众号文章 → 技术提取（沉淀到 09_tech 技术档案）</div>",
+                unsafe_allow_html=True)
+    urls_text = st.text_area(
+        "文章链接（每行一个，mp.weixin.qq.com；被反爬拦截时改用下方粘贴正文）",
+        height=100, key="wc_urls", placeholder="https://mp.weixin.qq.com/s/...")
+    with st.expander("或直接粘贴正文（单篇）"):
+        raw_title = st.text_input("标题", key="wc_raw_title")
+        raw_account = st.text_input("公众号名", key="wc_raw_account")
+        raw_content = st.text_area("正文", height=150, key="wc_raw_content")
+    tech_running = _tech_job_running()
+    if st.button("🧪 技术提取", type="primary", key="wc_analyze", disabled=tech_running):
+        articles = []
+        urls = [u.strip() for u in urls_text.split("\n") if u.strip()]
+        if urls:
+            with st.spinner(f"抓取 {len(urls)} 篇文章…"):
+                for u in urls:
+                    articles.append(radar_wechat.fetch_article(u))
+        if raw_content.strip():
+            articles.append({"url": "", "title": raw_title.strip(),
+                             "account": raw_account.strip(), "date": "",
+                             "text": raw_content.strip()})
+        ok = [a for a in articles if a.get("text")]
+        for a in articles:
+            if not a.get("text"):
+                st.warning(f"抓取失败：{a.get('url', '粘贴正文')}（{a.get('error', '无正文')}）")
+        if ok:
+            _start_tech_job(_run_tech_extract, (ok,))  # 后台提取，进度落盘 tech_job.json
             st.rerun()
 
-        # 合并完成通知（消费一次即弃）
-        merged = st.session_state.get("wc_tech_merged")
-        if merged is not None:
-            del st.session_state["wc_tech_merged"]
-            if merged.get("done"):
-                st.success(f"已入库 {merged['done']} 篇：{'、'.join(merged['names'])}，见「技术沉淀」分类")
-                if "wc_tech" in st.session_state:
-                    del st.session_state["wc_tech"]
-                on_saved()
-            for err in merged.get("errors", []):
-                st.warning(f"合并失败：{err}")
+    tjob = _read_tech_job()
+    _render_tech_job_live()  # 固定挂载，内部按状态决定是否渲染
+    if tech_running:
+        pass
+    elif tjob and tjob.get("status") == "running":
+        # 任务文件仍是 running 但线程已不在：应用曾被重启/进程被杀，任务中断
+        st.warning("上次技术任务被中断（应用重启或进程退出），结果可能不完整，可重新发起。")
+    elif tjob and tjob.get("status") in ("done", "error"):
+        if tjob.get("phase") == "merge":
+            st.session_state["wc_tech_merged"] = tjob.get("merged") or {}
+        else:
+            st.session_state["wc_tech"] = tjob.get("results", [])
+        _clear_tech_job()
+        st.rerun()
 
-        results = st.session_state.get("wc_tech") if not tech_running else None
-        if results is not None:
-            good = [r for r in results if r["ext"]]
-            for r in results:
-                if not r["ext"]:
-                    st.warning(f"提取失败：{r['article'].get('title') or '粘贴正文'}（{r['error']}）")
-            if not good:
-                st.info("没有可入库的技术内容。")
-            else:
-                st.markdown(f"<div class='caption'>提取 {len(good)} 篇，确认后合并进技术档案"
-                            "（同主题往上填，没有对应文档则新建）</div>", unsafe_allow_html=True)
-                for r in good:
-                    a, ext = r["article"], r["ext"]
-                    name = tech.resolve_target_name(ext)
-                    is_new = not os.path.exists(tech.resolve_target_path(name))
-                    tag = "🆕 新建" if is_new else "🔀 合并"
-                    with st.expander(f"{tag}《{a.get('title') or '粘贴正文'}》→ {name[:-3]}"):
-                        if ext.get("one_liner"):
-                            st.markdown(f"**定位**：{ext['one_liner']}")
-                        if ext.get("principle"):
-                            st.markdown(f"**原理**：{ext['principle'][:150]}"
-                                        + ("…" if len(ext["principle"]) > 150 else ""))
-                        for p in ext.get("key_points", []):
-                            st.markdown(f"- {p}")
-                if st.button("💾 合并入库（09_tech）", key="wc_save"):
-                    _start_tech_job(_run_tech_merge, (good,))  # 后台合并，进度落盘 tech_job.json
-                    st.rerun()
+    # 合并完成通知（消费一次即弃）
+    merged = st.session_state.get("wc_tech_merged")
+    if merged is not None:
+        del st.session_state["wc_tech_merged"]
+        if merged.get("done"):
+            st.success(f"已入库 {merged['done']} 篇：{'、'.join(merged['names'])}，见「技术沉淀」分类")
+            if "wc_tech" in st.session_state:
+                del st.session_state["wc_tech"]
+            on_saved()
+        for err in merged.get("errors", []):
+            st.warning(f"合并失败：{err}")
+
+    results = st.session_state.get("wc_tech") if not tech_running else None
+    if results is not None:
+        good = [r for r in results if r["ext"]]
+        for r in results:
+            if not r["ext"]:
+                st.warning(f"提取失败：{r['article'].get('title') or '粘贴正文'}（{r['error']}）")
+        if not good:
+            st.info("没有可入库的技术内容。")
+        else:
+            st.markdown(f"<div class='caption'>提取 {len(good)} 篇，确认后合并进技术档案"
+                        "（同主题往上填，没有对应文档则新建）</div>", unsafe_allow_html=True)
+            for r in good:
+                a, ext = r["article"], r["ext"]
+                name = tech.resolve_target_name(ext)
+                is_new = not os.path.exists(tech.resolve_target_path(name))
+                tag = "🆕 新建" if is_new else "🔀 合并"
+                with st.expander(f"{tag}《{a.get('title') or '粘贴正文'}》→ {name[:-3]}"):
+                    if ext.get("one_liner"):
+                        st.markdown(f"**定位**：{ext['one_liner']}")
+                    if ext.get("principle"):
+                        st.markdown(f"**原理**：{ext['principle'][:150]}"
+                                    + ("…" if len(ext["principle"]) > 150 else ""))
+                    for p in ext.get("key_points", []):
+                        st.markdown(f"- {p}")
+            if st.button("💾 合并入库（09_tech）", key="wc_save"):
+                _start_tech_job(_run_tech_merge, (good,))  # 后台合并，进度落盘 tech_job.json
+                st.rerun()
+
+
+# ---------- 主入口 ----------
+
+def render_radar(index, on_saved):
+    st.markdown('<div class="page-wide-marker"></div>', unsafe_allow_html=True)
+    st.markdown("<div class='section-label'>投资雷达</div>"
+                "<div class='page-title' style='font-size:24px'>市场信号与认知跟踪</div>",
+                unsafe_allow_html=True)
+
+    # 子导航：st.button 文字 tab，session_state 切换 + websocket rerun，不再整页刷新
+    cur = st.session_state.get("radar_tab", "overview")
+    if cur not in dict(_RADAR_TABS):
+        cur = "overview"
+    st.markdown("<div class='radar-nav-marker'></div>", unsafe_allow_html=True)
+    tab_cols = st.columns([1.3, 1.05, 1.2, 1.3, 1.1, 1.15, 12])
+    for col, (k, lbl) in zip(tab_cols, _RADAR_TABS):
+        with col:
+            if st.button(lbl, key=f"radar_tab_{k}",
+                         type="primary" if k == cur else "secondary"):
+                st.session_state.radar_tab = k
+                st.rerun()
+
+    if cur == "overview":
+        _render_overview()
+    elif cur == "signals":
+        _render_signals()
+    elif cur == "themes":
+        _render_themes()
+    elif cur == "variables":
+        _render_variables()
+    elif cur == "reports":
+        _render_reports(index, on_saved)
+    elif cur == "sources":
+        _render_sources(on_saved)

@@ -323,14 +323,26 @@ def _table_rects(page, pymupdf):
         return []
 
 
+def _text_cover_frac(page, r, pymupdf):
+    """候选图区被文字覆盖的面积比例：表格/正文区文字密集，真图表只有坐标轴刻度
+    与零星标注、文字覆盖率低。find_tables 只能检出带线框的表格，无边框表格靠
+    这个兜底——文字密集的「图区」截出来就是一张表格图片，可提取性全丢。"""
+    try:
+        area = sum(pymupdf.Rect(w[:4]).get_area() for w in page.get_text("words", clip=r))
+    except Exception:
+        return 0.0
+    return area / (r.get_area() or 1)
+
+
 def _extract_images(data):
     """截取 PDF 中的重要图表为 PNG（纯本地 pymupdf，不调模型）。
     两类图区：
     - 嵌入位图（get_image_info 拿 bbox）：照片/扫描插图，面积占页 ≥ IMG_MIN_FRAC 才算重要；
     - 矢量图表（研报/论文图表多为矢量）：get_drawings 路径数 ≥ 30 且并集面积 ≥ 15% 页，
       对整个并集区域截图——位图提取拿不到矢量图，截图是通用兜底。
-    区域重叠先合并；按内容 md5 去重（每页重复的 logo 只留一张）；每页最多 2 张、
-    全文档最多 IMG_MAX 张。无 pymupdf（裸环境）返回 []，不影响主链。
+    区域重叠先合并；find_tables 检出的表格区域与文字密集区（无边框表格/正文）
+    一律跳过——能提取成 md 表格的内容不截图；按内容 md5 去重（每页重复的 logo
+    只留一张）；每页最多 2 张、全文档最多 IMG_MAX 张。无 pymupdf（裸环境）返回 []，不影响主链。
     返回 [{"page": 1-based, "name": "p12_1.png", "data": png_bytes}]。"""
     if IMG_MAX <= 0:
         return []
@@ -373,8 +385,10 @@ def _extract_images(data):
                     continue
                 if tabs is None:  # 惰性检测：只对有候选图区的页跑 find_tables
                     tabs = _table_rects(page, pymupdf)
-                if any(_overlap_frac(r, tr) >= 0.5 for tr in tabs):
+                if any(_overlap_frac(r, tr) >= 0.3 for tr in tabs):
                     continue  # 表格区域：文本层已带 md 表格，不再截图
+                if _text_cover_frac(page, r, pymupdf) >= 0.2:
+                    continue  # 文字密集区（无边框表格/正文段落）：不是图表，不截图
                 png = page.get_pixmap(clip=r, dpi=IMG_DPI).tobytes("png")
                 h = hashlib.md5(png).hexdigest()
                 if h in seen:

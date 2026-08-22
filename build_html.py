@@ -280,7 +280,10 @@ details .detail-body { margin-top:0.6rem; }
   background:none; padding:0; font-size:0.82rem; line-height:1.5;
   font-family:"Sarasa Mono SC","Cascadia Mono","Noto Sans Mono CJK SC",Consolas,"Microsoft YaHei",monospace;
 }
-.md img { max-width:100%; }
+.md img {
+  max-width:70%; max-height:420px; object-fit:contain;
+  display:block; margin:0.6rem auto;
+}
 .md hr { border:none; border-top:1px solid var(--kb-border); margin:1.4rem 0; }
 
 /* 对比页表格（复用 .md table 的浅色风格） */

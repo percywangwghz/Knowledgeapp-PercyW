@@ -419,7 +419,7 @@ def organize_document(filename, text, category_key="", on_chunk=None, chunk_cb=N
             for n in images)
         image_block = (f"- 本文档自动截取了这些图表：{inv}。某小节内容与某张图直接相关时，"
                        "在该小节末尾单独起一行写占位符 [[图:文件名]]（如 [[图:p3_1.png]]），"
-                       "只许使用清单内的文件名，无关就不要引用。\n")
+                       "只许使用清单内的文件名，无关就不要引用（未被引用的图不会入库）。\n")
     else:
         image_block = ""
     chunks = _split_chunks(text, TEXT_LIMIT)
@@ -513,18 +513,24 @@ _IMG_TOKEN_RE = re.compile(r"\[\[图\s*[:：]\s*([^\]]+?)\s*\]\]")
 
 
 def _attach_images(result, folder, name, lines):
-    """把该文件暂存的图表 PNG 搬进 knowledge/assets/img/<文档名>/。
-    两处落位：正文里模型留下的 [[图:文件名]] 占位符（organize 时按页码清单
-    标注）原地替换为相对路径引用，让图表跟着相关分析走；未被引用的图
-    才汇总为文末图集段（返回的 md 行）。相对路径引用（Obsidian/Typora/
-    导出 HTML 可直接显示）；暂存缺失跳过不报错，搬完清掉该文件的暂存目录。"""
+    """把正文 [[图:文件名]] 占位符实际引用的图表 PNG 搬进 knowledge/assets/img/<文档名>/，
+    占位符原地替换为相对路径引用，让图表跟着相关分析走。
+    未被引用的图（模型判断与正文无关）不搬运、不附录，随暂存目录一并清掉——
+    自动截取是广撒网兜底，无关图表堆进文档只会稀释信息密度（用户明确要求）。
+    相对路径引用（Obsidian/Typora/导出 HTML 可直接显示）；暂存缺失跳过不报错。
+    恒返回 []（已取消文末图集段）。"""
     images = result.get("images") or []
     if not images:
         return []
     src_dir = os.path.join(_path(IMG_STAGE_DIR), _slug(result.get("file", "")))
-    img_dir = os.path.join(config.KNOWLEDGE_DIR, "assets", "img", name)
+    used = []
+    for ln in lines:
+        for n in _IMG_TOKEN_RE.findall(ln):
+            if n in images and n not in used:
+                used.append(n)
     refs = {}
-    for im_name in images:
+    img_dir = os.path.join(config.KNOWLEDGE_DIR, "assets", "img", name)
+    for im_name in used:
         src = os.path.join(src_dir, im_name)
         if not os.path.isfile(src):
             continue
@@ -536,26 +542,16 @@ def _attach_images(result, folder, name, lines):
         rel = os.path.relpath(dst, folder).replace(os.sep, "/")
         refs[im_name] = f"![{cap} 图表]({rel})"
     shutil.rmtree(src_dir, ignore_errors=True)
-    if not refs:
-        return []
-    used = set()
     for i, ln in enumerate(lines):
         def _sub(m):
-            im_name = m.group(1)
-            if im_name in refs:
-                used.add(im_name)
-                return refs[im_name]
-            return m.group(0)  # 清单外占位符：保留原样，不造不存在的引用
+            return refs.get(m.group(1), m.group(0))  # 清单外/暂存缺失占位符保留原样
         lines[i] = _IMG_TOKEN_RE.sub(_sub, ln)
-    gallery = [refs[n] for n in images if n in refs and n not in used]
-    if not gallery:
-        return []
-    return ["", "## 📷 其他图表（自动截取）", ""] + gallery
+    return []
 
 
 def save_document(result, source_name):
     """写入知识库对应分类目录（category_key 为空时写入根目录 → 索引为"其他"）。
-    文件名冲突自动加序号。在标题行后插入来源行；有截取图表时文末加图集段。
+    文件名冲突自动加序号。在标题行后插入来源行；正文引用的截取图表就地内联。
     原文全文不落文档（用户明确要求不留），改判重整的原文由入库计划/上传缓存供给。
     返回绝对路径。"""
     folder = (os.path.join(config.KNOWLEDGE_DIR, result["category_key"])
@@ -1023,6 +1019,8 @@ def _category_options():
 
 def render_ingest(index, on_saved):
     import streamlit as st
+    # 与 reader/battle/radar 一致：撑开主区，消除两侧留白
+    st.markdown('<div class="page-wide-marker"></div>', unsafe_allow_html=True)
     st.markdown("<div class='doc-title'>📥 文件归档</div>", unsafe_allow_html=True)
     st.markdown("<div class='meta-line'>拖入 PDF / DOCX / TXT / MD，AI 读取内容、提议分类并整理成结构化文档；"
                 "分类可人工改判，确认后写入知识库。</div>", unsafe_allow_html=True)

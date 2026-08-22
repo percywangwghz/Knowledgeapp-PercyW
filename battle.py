@@ -10,6 +10,7 @@ AI 在限定方法论下扮演投委会反对派，与用户辩论已沉淀的�
   覆盖更新到项目文档的 ## ⚔️ Battle 记录 节。
 """
 import hashlib
+import html
 import json
 import os
 import re
@@ -392,15 +393,18 @@ def _prepare_preview(doc):
 
 
 def _confirm_writeback(doc, on_saved):
-    """写回第二阶段：用户点「确认写回」后才真正落盘。"""
-    preview = st.session_state.pop("battle_preview", None)
+    """写回第二阶段：用户点「确认写回」后才真正落盘。
+    预览先校验后落盘、成功才丢弃——写回失败时预览保留，用户可重试 Approve，
+    不必重新生成（重新生成要再花一次 AI 调用）。"""
+    preview = st.session_state.get("battle_preview")
     if not preview or preview.get("doc_path") != doc["path"]:
         return
     try:
         path = _write_back(doc, preview["data"])
     except Exception as e:
-        st.error(f"写回失败：{e}")
+        st.error(f"写回失败：{e}。预览仍保留，可重试确认写回。")
         return
+    st.session_state.pop("battle_preview", None)
     on_saved()
     st.session_state.battle_flash = (
         f"已更新 `{os.path.basename(path)}` 的「⚔️ Battle 记录」："
@@ -409,38 +413,200 @@ def _confirm_writeback(doc, on_saved):
     st.rerun()
 
 
-# ==================== 主视图 ====================
+# ==================== 主视图（demo §9 三栏辩论室） ====================
+
+_PHASE_LABELS = {
+    1: "假设攻击",
+    2: "证伪检验",
+    3: "反向世界",
+    4: "论点评估",
+}
+_PHASE_FLOW = "01 假设 → 02 证伪 → 03 反世界 → 04 评估"
+
+# 假设验证程度 → 右栏状态点（demo .assumption-row .st）
+_VERIFY_STATE = {"已验证": ("成立", "ok"),
+                 "部分验证": ("受质疑", "attacked"),
+                 "未验证": ("未验证", "broken")}
+
+
+def _esc(s):
+    return html.escape(str(s or ""))
+
+
+def _parse_battle_state(content):
+    """从文档「## ⚔️ Battle 记录」节解析当前状态面板数据；无此节返回 None。
+    节结构见 _render_state_md：状态行 / Core Belief / 关键假设表 / 证伪条件表 / 反向世界。"""
+    m = re.search(r"^## ⚔️ Battle 记录\n.*?(?=^## |\Z)", content or "",
+                  re.DOTALL | re.MULTILINE)
+    if not m:
+        return None
+    sec = m.group(0)
+    out = {"status": "", "status_desc": "", "conf_from": None, "conf_to": None,
+           "core_belief": "", "assumptions": [], "falsifications": [],
+           "counter_world": "", "closer_world": ""}
+    sm = re.search(r"\*\*观点状态：(\w+)\*\*（([^）]*)）\s*·\s*置信度\s*(\d+)%\s*→\s*(\d+)%", sec)
+    if sm:
+        out["status"], out["status_desc"] = sm.group(1), sm.group(2)
+        out["conf_from"], out["conf_to"] = int(sm.group(3)), int(sm.group(4))
+    cb = re.search(r"\*\*Core Belief\*\*：(.+)", sec)
+    if cb:
+        out["core_belief"] = cb.group(1).strip()
+    cw = re.search(r"\*\*反向世界\*\*：(.+?)（当前现实更接近：(.+?)）", sec)
+    if cw:
+        out["counter_world"], out["closer_world"] = cw.group(1).strip(), cw.group(2).strip()
+
+    def _table(header):
+        tm = re.search(r"\| *" + header + r" *\|[^\n]*\n\|[\s\-|]+\|\n((?:\|[^\n]*\|\n?)+)",
+                       sec)
+        if not tm:
+            return []
+        rows = []
+        for line in tm.group(1).strip().split("\n"):
+            cells = [c.strip().replace("\\|", "|")
+                     for c in line.strip().strip("|").split("|")]
+            if any(c and c != "—" for c in cells):
+                rows.append(cells)
+        return rows
+
+    out["assumptions"] = _table("关键假设")       # [假设, 验证程度, 风险]
+    out["falsifications"] = _table("证伪条件")    # [条件, 状态, 当前证据]
+    return out
+
+
+def _current_phase(msgs):
+    """当前辩论阶段：取最后一条 AI 发言的【Step N · 名称】标注；没有则默认第一步。"""
+    for m in reversed(msgs):
+        if m["role"] != "assistant":
+            continue
+        sm = re.search(r"【Step\s*(\d+)\s*·\s*([^】]+)】", m["content"])
+        if sm:
+            return _PHASE_LABELS.get(int(sm.group(1)), _esc(sm.group(2)).upper())
+        break  # 只看最后一条 AI 发言
+    return _PHASE_LABELS[1]
+
+
+def _entry_html(idx, role, content):
+    """demo .battle-entry：左细竖线 + AI/YOU 标签 + mono 序号 + 正文（AI 竖线 accent）。
+    消息没有持久化时间戳（{role, content}），用 mono 序号代替 demo 的时间位。"""
+    who = "AI" if role == "assistant" else "YOU"
+    cls = "battle-entry ai" if role == "assistant" else "battle-entry"
+    # 轻量 markdown：先全文 escape 防注入，再恢复 **粗体**；空行分段、单换行 <br>
+    body = _esc(content)
+    body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
+    paras = "".join(f"<p>{p.replace(chr(10), '<br>')}</p>"
+                    for p in re.split(r"\n\s*\n", body) if p.strip())
+    return (f"<div class='{cls}'><div class='who'>{who}"
+            f"<span class='time'>#{idx:02d}</span></div>"
+            f"<div class='body'>{paras}</div></div>")
+
+
+def _confidence_html(conf_to):
+    """demo .confidence-box：等级 + 3px 细条（宽度=置信度百分比）。"""
+    if conf_to is None:
+        return ""
+    level = "高" if conf_to >= 70 else ("中" if conf_to >= 40 else "低")
+    return ("<div class='battle-kv confidence-box'><div class='k'>置信度</div>"
+            f"<div class='level'>{level} · {conf_to}%</div>"
+            f"<div class='bar'><i style='width:{conf_to}%'></i></div></div>")
+
+
+def _thesis_context_html(doc, state):
+    """左栏 THESIS CONTEXT：项目 / 核心观点 / Evidence / Assumptions。"""
+    title = doc.get("title") or doc["name"].replace(".md", "")
+    # 核心观点：文档副标题（> 引用行）或首段；写过 Battle 的以 Core Belief 为准
+    belief = (state or {}).get("core_belief") or (doc.get("subtitle") or "").strip()
+    if not belief:
+        m = re.search(r"\n\s*\n([^\n#>|-][^\n]+)", doc.get("content", ""))
+        belief = m.group(1).strip() if m else "—"
+    parts = ["<div class='section-label'>论文背景</div>",
+             f"<div class='battle-kv'><div class='k'>项目</div>"
+             f"<div class='v'>{_esc(title)}</div></div>",
+             f"<div class='battle-kv'><div class='k'>核心观点</div>"
+             f"<div class='v'>{_esc(belief[:200])}</div></div>"]
+    if state:
+        evidences = [f[2] for f in state["falsifications"] if len(f) > 2 and f[2] != "—"]
+        if evidences:
+            lis = "".join(f"<li>{_esc(e[:80])}</li>" for e in evidences[:5])
+            parts.append(f"<div class='battle-kv'><div class='k'>证据</div>"
+                         f"<div class='v'><ul>{lis}</ul></div></div>")
+        if state["assumptions"]:
+            lis = "".join(f"<li>{_esc(a[0][:80])}</li>" for a in state["assumptions"])
+            parts.append(f"<div class='battle-kv'><div class='k'>关键假设</div>"
+                         f"<div class='v'><ul>{lis}</ul></div></div>")
+    else:
+        parts.append("<div class='battle-kv'><div class='k'>证据</div>"
+                     "<div class='v' style='color:var(--text-tertiary);font-size:12px'>"
+                     "首场论战写回后生成</div></div>")
+    return "".join(parts)
+
+
+def _battle_state_html(state):
+    """右栏 BATTLE STATE：Core Assumptions（状态点）/ Unresolved / Falsification / Confidence。"""
+    if not state:
+        return ("<div class='section-label'>战斗状态</div>"
+                "<div class='battle-kv'><div class='v' "
+                "style='color:var(--text-tertiary);font-size:12px'>"
+                "暂无沉淀状态：结束今日论战并确认写回后，"
+                "这里会显示假设状态、证伪条件与置信度。</div></div>")
+    parts = ["<div class='section-label'>战斗状态</div>"]
+    if state["assumptions"]:
+        rows = []
+        for i, a in enumerate(state["assumptions"]):
+            verification = a[1] if len(a) > 1 else ""
+            label, cls = _VERIFY_STATE.get(verification, ("待验证", "attacked"))
+            rows.append(f"<div class='assumption-row'><span class='an'>{i + 1:02d}</span>"
+                        f"<span>{_esc(a[0][:40])}</span>"
+                        f"<span class='st {cls}'>{label}</span></div>")
+        parts.append(f"<div class='battle-kv'><div class='k'>关键假设</div>"
+                     f"<div class='v'>{''.join(rows)}</div></div>")
+    unresolved = sum(1 for a in state["assumptions"]
+                     if len(a) > 1 and a[1] in ("未验证", "部分验证"))
+    parts.append(f"<div class='battle-kv'><div class='k'>待验证</div>"
+                 f"<div class='v'>{unresolved:02d} 项</div></div>")
+    if state["falsifications"]:
+        f0 = state["falsifications"][0]
+        f_text = f0[0] + (f"（{_esc(f0[1])}）" if len(f0) > 1 and f0[1] else "")
+        parts.append(f"<div class='battle-kv'><div class='k'>证伪条件</div>"
+                     f"<div class='v' style='font-size:12.5px;color:var(--text-secondary)'>"
+                     f"{_esc(f_text[:120])}</div></div>")
+    parts.append(_confidence_html(state["conf_to"]))
+    return "".join(parts)
+
 
 def render_battle(index, on_saved):
-    st.markdown("<div class='doc-title'>⚔️ Thesis Battle</div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='meta-line'>AI 扮演投委会红队，在限定方法论下攻击你的观点。"
-        "不追求证明观点正确，而是寻找观点何时可能错误。</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("<div style='margin-bottom:1rem'></div>", unsafe_allow_html=True)
+    st.markdown('<div class="page-wide-marker"></div>', unsafe_allow_html=True)
+    st.markdown("<div class='section-label' style='margin-top:0.4rem'>论文之战</div>"
+                "<div class='page-title' style='font-size:24px'>投资观点压力测试</div>",
+                unsafe_allow_html=True)
 
     if not get_api_key():
         st.warning("未填入 API Key，AI 功能不可用："
                    "请先在左侧边栏「API 设置」处填入你自己的 key（sk-...）。")
         return
 
-    # ---- 选择观点来源文档 ----
+    # ---- 观点来源文档：widget 画在左栏顶部，取值先从 session_state 读 ----
+    # （widget 状态在上一轮已写入 session_state.battle_doc；后置渲染，值先行——
+    #   这样文档解析/会话恢复等逻辑可以保持在三栏渲染之前）
     docs = sorted(index.get("documents", []),
                   key=lambda d: (d.get("category_key") != "02_deals", d.get("category", ""), d["name"]))
     options = {f"{d.get('category_icon', '📁')} [{d.get('category', '其他')}] "
                f"{d.get('title') or d['name'].replace('.md', '')}": d for d in docs}
     labels = list(options.keys())
     if not labels:
-        st.info("知识库还没有可 Battle 的文档：先到「📥 文件归档」归档一篇项目/行业文档，再回来。")
+        st.info("知识库还没有可论战的文档：先到「📥 文件归档」归档一篇项目/行业文档，再回来。")
         return
     default_idx = 0
     for i, label in enumerate(labels):
         if options[label]["path"] == st.session_state.get("battle_doc_path"):
             default_idx = i
             break
-    chosen = st.selectbox("观点来源文档", labels, index=default_idx, key="battle_doc")
-    doc = options[chosen]
+    _prev_label = st.session_state.get("battle_doc")
+    if _prev_label in options:
+        doc = options[_prev_label]
+    else:
+        doc = options[labels[default_idx]]
+    _cur_idx = labels.index(next(l for l, o in options.items()
+                                 if o["path"] == doc["path"]))
 
     if doc["path"] != st.session_state.get("battle_doc_path"):
         st.session_state.battle_doc_path = doc["path"]
@@ -475,29 +641,30 @@ def render_battle(index, on_saved):
     if st.session_state.pop("battle_finalize", False):
         _prepare_preview(doc)  # 只生成预览，需用户审批后才落盘
 
-    # ---- 当前沉淀状态 ----
-    cur = re.search(r"^## ⚔️ Battle 记录\n.*?(?=^## |\Z)", doc.get("content", ""),
-                    re.DOTALL | re.MULTILINE)
-    with st.expander("📊 当前沉淀状态与历史日志", expanded=False):
-        if cur:
-            st.markdown(cur.group(0))
-        else:
-            st.info("该文档尚无 Battle 记录，本场结束后将自动创建。")
-
-    # ---- 写回预览（待审批）：确认前文档不会被修改 ----
+    # ---- 写回预览：fixed 右侧抽屉（demo REVIEW PENDING），Approve 前文档不会被修改 ----
     preview = st.session_state.get("battle_preview")
     if preview and preview.get("doc_path") == doc["path"]:
         today = datetime.now().strftime("%Y-%m-%d")
         with st.container(border=True):
-            st.markdown("**📋 写回预览（待审批）—— 以下内容经你确认后才会写入文档**")
+            st.markdown('<div class="kb-drawer-marker kb-drawer-preview"></div>',
+                        unsafe_allow_html=True)
+            st.markdown("<div class='drawer-title'>待审批</div>"
+                        "<div class='drawer-sub'>写回预览——确认后才会落盘到知识库源文件</div>",
+                        unsafe_allow_html=True)
+            st.markdown("<div class='drawer-rule'></div>", unsafe_allow_html=True)
             st.markdown(_render_state_md(preview["data"], today)
                         + _render_log_md(preview["data"], today))
-            c_ok, c_no, _ = st.columns([1, 1, 3])
+            st.markdown("<div class='drawer-rule'></div>"
+                        "<div class='drawer-sub'>写回遵循「预览 → 人工确认」流程；"
+                        "丢弃预览不影响对话，可继续聊或重新生成。</div>",
+                        unsafe_allow_html=True)
+            c_ok, c_no, _pad = st.columns([1.2, 1.2, 2])
             with c_ok:
-                if st.button("✅ 确认写回", type="primary", use_container_width=True):
+                if st.button("确认写回", type="primary", use_container_width=True,
+                             key="battle_wb_approve"):
                     _confirm_writeback(doc, on_saved)
             with c_no:
-                if st.button("❌ 取消", use_container_width=True,
+                if st.button("丢弃预览", use_container_width=True, key="battle_wb_reject",
                              help="丢弃预览，对话保留，可继续聊或重新生成"):
                     st.session_state.pop("battle_preview", None)
                     st.rerun()
@@ -505,74 +672,122 @@ def render_battle(index, on_saved):
         st.session_state.pop("battle_preview", None)  # 预览属于别的文档，丢弃
         preview = None
 
-    # ---- 操作行 ----
-    col_end, col_break, col_clear, col_note = st.columns([2, 1, 1, 2])
-    with col_end:
-        if st.button("💾 结束今日 Battle 并写回文档", type="primary",
-                     use_container_width=True,
-                     disabled=not msgs or busy or bool(preview),
-                     help="生成写回预览，经你确认后才写入文档"):
-            st.session_state.battle_finalize = True
-            st.rerun()
-    with col_break:
-        if st.button("🛑 中断", type="secondary", use_container_width=True,
-                     disabled=not msgs and not busy,
-                     help="放弃本场对话：取消在跑的回复、清空对话，绝不写回文档"):
-            _break_reply(doc["path"])
-            st.rerun()
-    with col_clear:
-        if st.button("🗑️ 清空对话", use_container_width=True, disabled=not msgs):
-            st.session_state.battle_msgs = []
-            _save_messages(doc["path"], [])
-            _remove_pending(doc["path"])
-            st.rerun()
-    with col_note:
+    # ---- 三栏辩论室（demo §9）：THESIS CONTEXT / BATTLE ROOM / BATTLE STATE ----
+    state = _parse_battle_state(doc.get("content", ""))
+    user_rounds = sum(1 for m in msgs if m["role"] == "user")
+    # round = 用户消息数+1；用户已发言等 AI 回复时停留在当前轮
+    round_no = max(1, user_rounds + (0 if msgs and msgs[-1]["role"] == "user" else 1))
+
+    left, center, right = st.columns([3.5, 6.0, 3.5], gap="medium")
+
+    with left:
+        st.markdown('<div class="battle-left-marker"></div>', unsafe_allow_html=True)
+        # 选择变化经 widget 状态在下一轮 rerun 顶部生效（见上文「值先行」注释）
+        st.selectbox("观点来源文档", labels, index=_cur_idx, key="battle_doc",
+                     label_visibility="collapsed")
+        st.markdown(_thesis_context_html(doc, state), unsafe_allow_html=True)
+
+    with right:
+        st.markdown('<div class="battle-right-marker"></div>', unsafe_allow_html=True)
+        st.markdown(_battle_state_html(state), unsafe_allow_html=True)
+
+    with center:
         st.markdown(
-            "<div class='meta-line' style='margin-top:0.6rem'>说「今天到这里」会生成写回预览，"
-            "经你确认后才落盘；「中断」放弃整场对话且绝不写回。</div>",
-            unsafe_allow_html=True,
-        )
+            "<div class='round-banner'>"
+            f"<span class='round'>第 {round_no:02d} 轮</span>"
+            f"<span class='phase'>{_current_phase(msgs)}</span>"
+            f"<span class='phase-flow'>{_PHASE_FLOW}</span></div>",
+            unsafe_allow_html=True)
 
-    st.divider()
+        # ---- 对话区：限定高度的滚动框（CSS 见 app.py .battle-msgs-marker）——
+        # 空态、消息流、流式打字机全在框内；框下方是吸底的操作区。
+        # 标记放在容器【外】紧邻其前：CSS 用相邻兄弟选择器只打容器本身，
+        # 若放容器内 :has 会同时命中容器与标记自身两层（标记行会抢 flex 空间） ----
+        st.markdown('<div class="battle-msgs-marker"></div>', unsafe_allow_html=True)
+        with st.container():
 
-    # ---- 对话区 ----
-    if not msgs and not busy:
-        st.info("红队已就位。点击下方按钮让 AI 先开火，或直接发言陈述你的观点。")
-        if st.button("🔴 让 AI 先开火", type="primary"):
-            st.session_state.battle_pending = (
-                "请通读我的观点文档，然后从 Step 1 · Assumption Attack 开始，"
-                "攻击其中最脆弱的一到两个假设。"
-            )
+            # ---- 空态（demo）：红队已就位 + [让 AI 先开火] ----
+            if not msgs and not busy:
+                st.markdown("<div class='empty-state'>"
+                            "<div class='e-title'>红队已就位</div>"
+                            "<div class='e-sub'>让 AI 先开火，或直接发言陈述你的观点。"
+                            "说「今天到这里」会生成写回预览，经你确认后才落盘。</div></div>",
+                            unsafe_allow_html=True)
+                if st.button("🔴 让 AI 先开火", type="primary", key="battle_first_fire"):
+                    st.session_state.battle_pending = (
+                        "请通读我的观点文档，然后从 Step 1 · Assumption Attack 开始，"
+                        "攻击其中最脆弱的一到两个假设。"
+                    )
+                    st.rerun()
+
+            # ---- 消息流：demo 研究记录样式（竖线 + AI/YOU 标签），非聊天气泡 ----
+            if msgs:
+                st.markdown("".join(_entry_html(i + 1, m["role"], m["content"])
+                                    for i, m in enumerate(msgs)),
+                            unsafe_allow_html=True)
+
+            # ---- 后台回复状态：进行中打字机显示 / 中断 / 失败 ----
+            _render_reply_live(doc["path"])  # 固定挂载，内部按状态决定是否渲染
+            if pend and pend.get("status") == "running":
+                if _pending_stale(doc["path"], pend):
+                    st.warning("AI 回复被中断（应用重启或进程退出）。你的发言已保留，可重新发送。")
+                    _remove_pending(doc["path"])
+                    pend = None
+                    busy = False
+            elif pend and pend.get("status") == "error":
+                # 不丢弃用户已发消息（已落盘），只报错，可重试
+                st.error(f"调用 AI 失败：{pend.get('error', '未知错误')}。你的发言已保留，可重新发送或稍后再试。")
+                _remove_pending(doc["path"])
+                pend = None
+                busy = False
+
+        # ---- 操作行（quiet 按钮，demo 操作区样式） ----
+        # 停靠标记：把下方操作区（按钮 + 输入框）吸附到中栏底部
+        st.markdown('<div class="battle-dock-marker"></div>', unsafe_allow_html=True)
+        c_next, c_end, c_break, c_clear = st.columns([2.2, 2.2, 1.4, 1.4])
+        with c_next:
+            if st.button("开始下一次攻击", type="primary", key="battle_next",
+                         use_container_width=True,
+                         disabled=busy or not msgs,
+                         help="让红队按方法论推进下一轮攻击"):
+                st.session_state.battle_pending = (
+                    "继续：按方法论推进到下一步，针对我上一条回应发起下一轮攻击。"
+                )
+                st.rerun()
+        with c_end:
+            if st.button("结束今日论战并写回", key="battle_finalize_btn",
+                         use_container_width=True,
+                         disabled=not msgs or busy or bool(preview),
+                         help="生成写回预览，经你确认后才写入文档"):
+                st.session_state.battle_finalize = True
+                st.rerun()
+        with c_break:
+            if st.button("中断", key="battle_break", use_container_width=True,
+                         disabled=not msgs and not busy,
+                         help="放弃本场对话：取消在跑的回复、清空对话，绝不写回文档"):
+                _break_reply(doc["path"])
+                st.rerun()
+        with c_clear:
+            if st.button("清空", key="battle_clear", use_container_width=True,
+                         disabled=not msgs):
+                st.session_state.battle_msgs = []
+                _save_messages(doc["path"], [])
+                _remove_pending(doc["path"])
+                # 连同待审批的写回预览一并丢弃：对话已清空，留着旧预览会
+                # 把已作废讨论的提取结果写回文档（与「中断」按钮同构）
+                st.session_state.pop("battle_preview", None)
+                st.session_state.pop("battle_finalize", None)
+                st.rerun()
+
+        queued = st.session_state.pop("battle_pending", None)
+        prompt = st.chat_input("输入你的回应…（说「今天到这里」收工并生成写回预览）",
+                               disabled=busy)
+        text = prompt or queued
+        if text:
+            if busy:
+                st.warning("AI 正在回复中，请等当前回复完成后再发言。")
+                return
+            msgs.append({"role": "user", "content": text})
+            _save_messages(doc["path"], msgs)  # 发言立即落盘，刷新不丢
+            _start_reply(doc, doc["path"])     # 后台线程生成回复，不在 rerun 内等待
             st.rerun()
-
-    for m in msgs:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
-
-    # ---- 后台回复状态：进行中打字机显示 / 中断 / 失败 ----
-    _render_reply_live(doc["path"])  # 固定挂载，内部按状态决定是否渲染
-    if pend and pend.get("status") == "running":
-        if _pending_stale(doc["path"], pend):
-            st.warning("AI 回复被中断（应用重启或进程退出）。你的发言已保留，可重新发送。")
-            _remove_pending(doc["path"])
-            pend = None
-            busy = False
-    elif pend and pend.get("status") == "error":
-        # 不丢弃用户已发消息（已落盘），只报错，可重试
-        st.error(f"调用 AI 失败：{pend.get('error', '未知错误')}。你的发言已保留，可重新发送或稍后再试。")
-        _remove_pending(doc["path"])
-        pend = None
-        busy = False
-
-    queued = st.session_state.pop("battle_pending", None)
-    prompt = st.chat_input("为你的观点辩护、抛出新证据，或说「今天到这里」收工……",
-                           disabled=busy)
-    text = prompt or queued
-    if text:
-        if busy:
-            st.warning("AI 正在回复中，请等当前回复完成后再发言。")
-            return
-        msgs.append({"role": "user", "content": text})
-        _save_messages(doc["path"], msgs)  # 发言立即落盘，刷新不丢
-        _start_reply(doc, doc["path"])     # 后台线程生成回复，不在 rerun 内等待
-        st.rerun()
